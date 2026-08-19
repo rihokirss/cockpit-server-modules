@@ -21,6 +21,7 @@ CONFIG = STATE_DIR / 'config.json'
 AUDIT = Path('/var/log/cockpit-radius-audit.jsonl')
 AUTH_LOG = Path('/var/log/freeradius/cockpit-radius-auth.log')
 ACCT_LOG = Path('/var/log/freeradius/cockpit-radius-accounting.log')
+RADIUS_LOG = Path('/var/log/freeradius/radius.log')
 CERT_DIR = ROOT / 'certs/cockpit-radius'
 CA_CERT = CERT_DIR / 'ca.pem'
 CA_KEY = CERT_DIR / 'ca.key'
@@ -418,7 +419,9 @@ def activity():
                 except ValueError:
                     pass
             accounting += 1
-    service_log = run(['/usr/bin/journalctl', '-u', 'freeradius', '-n', '100', '--no-pager'], False).stdout
+    journal = run(['/usr/bin/journalctl', '-u', 'freeradius', '-n', '100', '--no-pager'], False).stdout
+    radius_log = tail(RADIUS_LOG, 160)
+    service_log = journal + ('\n\nFreeRADIUS logi\n' + radius_log if radius_log else '')
     return {'accepts': accepts, 'rejects': rejects, 'accounting': accounting,
             'auth_log': '\n'.join(visible[-200:]), 'service_log': service_log[-24000:]}
 
@@ -501,6 +504,8 @@ def main(request):
     action = request.get('action', '')
     if action == 'status':
         return status()
+    if action == 'activity':
+        return {'activity': activity(), 'active': service_active()}
     if action == 'generate_secret':
         return {'secret': generate_secret()}
     if action == 'settings_save':
