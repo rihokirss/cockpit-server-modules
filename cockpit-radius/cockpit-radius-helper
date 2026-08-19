@@ -1,0 +1,582 @@
+#!/usr/bin/python3
+import base64
+import datetime
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import string
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+ROOT = Path('/etc/freeradius/3.0')
+STATE_DIR = Path('/etc/cockpit-radius')
+CONFIG = STATE_DIR / 'config.json'
+AUDIT = Path('/var/log/cockpit-radius-audit.jsonl')
+AUTH_LOG = Path('/var/log/freeradius/cockpit-radius-auth.log')
+ACCT_LOG = Path('/var/log/freeradius/cockpit-radius-accounting.log')
+CERT_DIR = ROOT / 'certs/cockpit-radius'
+CA_CERT = CERT_DIR / 'ca.pem'
+CA_KEY = CERT_DIR / 'ca.key'
+SERVER_CERT = CERT_DIR / 'server.pem'
+SERVER_KEY = CERT_DIR / 'server.key'
+CLIENTS_FILE = ROOT / 'clients.d/cockpit-radius.conf'
+MSCHAP_FILE = ROOT / 'mods-available/mschap'
+PAP_FILE = ROOT / 'mods-available/cockpit_ad_pap'
+LOG_FILE = ROOT / 'mods-available/cockpit_radius_log'
+SITE_FILE = ROOT / 'sites-available/cockpit-radius'
+EAP_FILE = ROOT / 'mods-available/eap'
+SMB_CONF = Path('/etc/samba/smb.conf')
+SAFE_NAME = re.compile(r'^[\w .@()\-+]{1,128}$', re.UNICODE)
+SAFE_HOST = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$')
+SAFE_SECRET = re.compile(r'^[A-Za-z0-9_~.@%+=:,/\-]{16,128}$')
+
+
+def run(args, check=True, timeout=60, input_text=None, env=None):
+    proc = subprocess.run(args, text=True, input=input_text, capture_output=True,
+                          timeout=timeout, env={**os.environ, 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', **(env or {})})
+    if check and proc.returncode:
+        raise RuntimeError((proc.stderr or proc.stdout).strip() or f'{args[0]} ebaõnnestus')
+    return proc
+
+
+def atomic_write(path, content, mode=0o640, owner=None, group=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        if owner is not None or group is not None:
+            shutil.chown(temporary, user=owner, group=group)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def audit(action, target='', ok=True):
+    try:
+        record = {'time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  'user': os.getenv('COCKPIT_USER') or os.getenv('USER', 'unknown'),
+                  'action': action, 'target': target, 'ok': ok}
+        AUDIT.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT.open('a') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+        os.chmod(AUDIT, 0o600)
+    except Exception:
+        pass
+
+
+def domain_info():
+    text = run(['/usr/bin/samba-tool', 'domain', 'info', '127.0.0.1', '--color=never']).stdout
+    values = {}
+    for line in text.splitlines():
+        if ':' in line:
+            key, value = line.split(':', 1)
+            values[key.strip()] = value.strip()
+    return {'realm': values.get('Forest', ''), 'netbios': values.get('Netbios domain', ''),
+            'dc': values.get('DC name', ''), 'site': values.get('Server site', '')}
+
+
+def ad_groups():
+    text = run(['/usr/bin/ldbsearch', '-H', '/var/lib/samba/private/sam.ldb',
+                '(objectClass=group)', 'sAMAccountName']).stdout
+    return sorted(set(re.findall(r'^sAMAccountName: (.+)$', text, re.M)), key=str.casefold)
+
+
+def validate_group(name):
+    name = str(name or '').strip()
+    if not SAFE_NAME.fullmatch(name) or name not in ad_groups():
+        raise ValueError('Valitud Active Directory gruppi ei leitud')
+    domain = domain_info()['netbios']
+    result = run(['/usr/bin/wbinfo', '--name-to-sid', f'{domain}\\{name}'])
+    sid = result.stdout.strip().split()[0]
+    if not re.fullmatch(r'S-1-(?:\d+-)+\d+', sid):
+        raise ValueError('Grupi turbeidentifikaatorit ei õnnestunud leida')
+    group_info = run(['/usr/bin/wbinfo', '--group-info', f'{domain}\\{name}']).stdout.strip().split(':')
+    if len(group_info) < 3 or not group_info[2].isdigit():
+        raise ValueError('Grupi winbind GID-d ei õnnestunud leida')
+    return name, sid, int(group_info[2])
+
+
+def group_member_count(group):
+    result = run(['/usr/bin/samba-tool', 'group', 'listmembers', group, '--hide-disabled', '--hide-expired', '--color=never'], False)
+    return len([line for line in result.stdout.splitlines() if line.strip()]) if result.returncode == 0 else 0
+
+
+def defaults():
+    domain = domain_info()
+    group = 'Radius' if 'Radius' in ad_groups() else ('Domain Users' if 'Domain Users' in ad_groups() else '')
+    _, sid, gid = validate_group(group) if group else ('', '', 0)
+    return {'server_name': f"radius.{domain['realm'].lower()}", 'allowed_group': group,
+            'group_sid': sid, 'group_gid': gid, 'auth_port': 1812, 'accounting_port': 1813,
+            'local_secret': generate_secret(), 'clients': []}
+
+
+def load_config():
+    if not CONFIG.exists():
+        config = defaults()
+        save_config(config)
+        return config
+    return json.loads(CONFIG.read_text())
+
+
+def save_config(config):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(CONFIG, json.dumps(config, ensure_ascii=False, indent=2) + '\n', 0o600, 'root', 'root')
+
+
+def generate_secret():
+    alphabet = string.ascii_letters + string.digits + '_-'
+    return ''.join(secrets.choice(alphabet) for _ in range(40))
+
+
+def validate_port(value, label):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f'{label} peab olema number')
+    if not 1024 <= port <= 65535:
+        raise ValueError(f'{label} peab olema vahemikus 1024–65535')
+    return port
+
+
+def validate_client(client):
+    name = str(client.get('name') or '').strip()
+    if not SAFE_NAME.fullmatch(name):
+        raise ValueError('Kliendi nimi sisaldab lubamatuid märke')
+    try:
+        network = ipaddress.ip_network(str(client.get('ipaddr') or '').strip(), strict=False)
+    except ValueError:
+        raise ValueError('Sisesta korrektne IP-aadress või CIDR-võrk')
+    secret = str(client.get('secret') or '')
+    if not SAFE_SECRET.fullmatch(secret):
+        raise ValueError('Jagatud võti peab olema 16–128 märki ja ei tohi sisaldada tühikuid')
+    description = str(client.get('description') or '').strip()[:200]
+    return {'id': str(client.get('id') or uuid.uuid4()), 'name': name,
+            'ipaddr': str(network), 'secret': secret, 'description': description}
+
+
+def escape_radius(value):
+    return str(value).replace('\\', '\\\\').replace('"', '\\"')
+
+
+def render_clients(config):
+    blocks = ['# Hallatud Cockpit RADIUS mooduli poolt.\n']
+    for client in config['clients']:
+        safe_id = re.sub(r'[^A-Za-z0-9_-]', '_', client['id'])
+        blocks.append(f'''client cockpit-{safe_id} {{\n    ipaddr = {client['ipaddr']}\n    secret = "{escape_radius(client['secret'])}"\n    shortname = "{escape_radius(client['name'])}"\n    nas_type = other\n}}\n''')
+    return '\n'.join(blocks)
+
+
+def localhost_secret():
+    text = (ROOT / 'clients.conf').read_text()
+    match = re.search(r'client\s+localhost\s*\{(.*?)\}', text, re.S)
+    secret = re.search(r'^\s*secret\s*=\s*([^\s#]+)', match.group(1), re.M) if match else None
+    if not secret:
+        raise RuntimeError('FreeRADIUS localhost kliendi võtit ei leitud')
+    return secret.group(1).strip('"')
+
+
+def render_mschap(config):
+    domain = domain_info()['netbios']
+    gid = config['group_gid']
+    return f'''# Hallatud Cockpit RADIUS mooduli poolt.\nmschap {{\n    use_mppe = yes\n    require_encryption = yes\n    require_strong = yes\n    ntlm_auth = "/usr/local/libexec/cockpit-radius-ntlm-auth --require-group-gid={gid} --domain={domain} --request-nt-key --allow-mschapv2 --username=%{{%{{Stripped-User-Name}}:-%{{%{{mschap:User-Name}}:-None}}}} --challenge=%{{%{{mschap:Challenge}}:-00}} --nt-response=%{{%{{mschap:NT-Response}}:-00}}"\n    ntlm_auth_timeout = 5\n}}\n'''
+
+
+def render_pap(config):
+    domain = domain_info()['netbios']
+    gid = config['group_gid']
+    return f'''# Hallatud Cockpit RADIUS mooduli poolt.\nexec cockpit_ad_pap {{\n    wait = yes\n    input_pairs = request\n    shell_escape = yes\n    timeout = 5\n    program = "/usr/local/libexec/cockpit-radius-ntlm-auth --require-group-gid={gid} --domain={domain} --request-nt-key --username=%{{%{{Stripped-User-Name}}:-%{{%{{mschap:User-Name}}:-None}}}} --password=%{{User-Password}}"\n}}\n'''
+
+
+def render_log_module():
+    return '''# Hallatud Cockpit RADIUS mooduli poolt.\nlinelog cockpit_radius_auth {\n    filename = ${logdir}/cockpit-radius-auth.log\n    permissions = 0640\n    format = "time=%S result=%{reply:Packet-Type} user=%{User-Name} nas=%{NAS-IP-Address} station=%{Calling-Station-Id}"\n}\nlinelog cockpit_radius_accounting {\n    filename = ${logdir}/cockpit-radius-accounting.log\n    permissions = 0640\n    format = "time=%S status=%{Acct-Status-Type} user=%{User-Name} nas=%{NAS-IP-Address} station=%{Calling-Station-Id} session=%{Acct-Session-Id}"\n}\n'''
+
+
+def render_site(config):
+    return f'''# Hallatud Cockpit RADIUS mooduli poolt.\nserver cockpit-radius {{\n    listen {{\n        type = auth\n        ipaddr = *\n        port = {config['auth_port']}\n        limit {{\n            max_connections = 32\n            lifetime = 0\n            idle_timeout = 30\n        }}\n    }}\n    listen {{\n        type = acct\n        ipaddr = *\n        port = {config['accounting_port']}\n        limit {{\n            max_connections = 32\n            lifetime = 0\n            idle_timeout = 30\n        }}\n    }}\n    authorize {{\n        filter_username\n        preprocess\n        suffix\n        mschap\n        eap {{\n            ok = return\n        }}\n        if (&User-Password && !control:Auth-Type) {{\n            update control {{\n                Auth-Type := cockpit_ad_pap\n            }}\n        }}\n        pap\n    }}\n    authenticate {{\n        Auth-Type MS-CHAP {{\n            mschap\n        }}\n        Auth-Type cockpit_ad_pap {{\n            cockpit_ad_pap\n        }}\n        eap\n    }}\n    preacct {{\n        preprocess\n        acct_unique\n        suffix\n    }}\n    accounting {{\n        cockpit_radius_accounting\n    }}\n    session {{\n        radutmp\n    }}\n    post-auth {{\n        cockpit_radius_auth\n        Post-Auth-Type REJECT {{\n            attr_filter.access_reject\n            cockpit_radius_auth\n        }}\n    }}\n}}\n'''
+
+
+_render_site_template = render_site
+
+
+def render_site(config):
+    return _render_site_template(config).replace('Auth-Type MS-CHAP', 'Auth-Type mschap')
+
+
+def ensure_eap():
+    original = STATE_DIR / 'originals/eap'
+    original.parent.mkdir(parents=True, exist_ok=True)
+    if not original.exists():
+        shutil.copy2(EAP_FILE, original)
+    text = original.read_text()
+    replacements = [
+        (r'(?m)^(\s*)default_eap_type\s*=.*$', r'\1default_eap_type = peap'),
+        (r'(?m)^(\s*)private_key_password\s*=.*$', r'\1# private_key_password ='),
+        (r'(?m)^(\s*)private_key_file\s*=.*$', rf'\1private_key_file = {SERVER_KEY}'),
+        (r'(?m)^(\s*)certificate_file\s*=.*$', rf'\1certificate_file = {SERVER_CERT}'),
+        (r'(?m)^(\s*)ca_file\s*=.*$', rf'\1ca_file = {CA_CERT}'),
+    ]
+    for pattern, replacement in replacements:
+        text, count = re.subn(pattern, replacement, text, count=1)
+        if count != 1:
+            raise RuntimeError('EAP konfiguratsiooni mall ei vasta oodatud kujule')
+    marker = '\t\t#\ttls_min_version = "1.2"'
+    if marker in text:
+        text = text.replace(marker, '\t\ttls_min_version = "1.2"', 1)
+    max_marker = '\t\t#\ttls_max_version = "1.2"'
+    if max_marker in text:
+        text = text.replace(max_marker, '\t\ttls_max_version = "1.2"', 1)
+    atomic_write(EAP_FILE, text, 0o640, 'root', 'freerad')
+
+
+def ensure_clients_include(config):
+    clients_conf = ROOT / 'clients.conf'
+    original = STATE_DIR / 'originals/clients.conf'
+    if not original.exists():
+        original.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(clients_conf, original)
+    text = clients_conf.read_text()
+    for local_name in ('localhost', 'localhost_ipv6'):
+        pattern = rf'(client\s+{local_name}\s*\{{.*?^\s*secret\s*=\s*)[^\s#]+'
+        text = re.sub(pattern, lambda match: match.group(1) + config['local_secret'], text, count=1, flags=re.S | re.M)
+    include = '$INCLUDE clients.d/'
+    if include not in text:
+        text = text.rstrip() + '\n\n# Cockpit RADIUS hallatud kliendid\n' + include + '\n'
+    atomic_write(clients_conf, text, 0o640, 'root', 'freerad')
+
+
+def ensure_samba_mschap():
+    text = SMB_CONF.read_text()
+    original = STATE_DIR / 'originals/smb.conf'
+    if not original.exists():
+        original.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SMB_CONF, original)
+    if re.search(r'(?mi)^\s*ntlm auth\s*=', text):
+        text = re.sub(r'(?mi)^\s*ntlm auth\s*=.*$', '\tntlm auth = mschapv2-and-ntlmv2-only', text, count=1)
+    else:
+        text = text.replace('[global]\n', '[global]\n\tntlm auth = mschapv2-and-ntlmv2-only\n', 1)
+    atomic_write(SMB_CONF, text, 0o644, 'root', 'root')
+    run(['/usr/bin/testparm', '-s'], timeout=30)
+    run(['/usr/bin/smbcontrol', 'all', 'reload-config'], False)
+
+
+def ensure_certificate(server_name, renew_server=False):
+    CERT_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CERT_DIR, 0o750)
+    shutil.chown(CERT_DIR, user='root', group='freerad')
+    if not CA_CERT.exists() or not CA_KEY.exists():
+        run(['/usr/bin/openssl', 'req', '-x509', '-newkey', 'rsa:3072', '-nodes', '-sha256', '-days', '3650',
+             '-subj', f'/O=KIRSS/CN=KIRSS RADIUS Root CA', '-keyout', str(CA_KEY), '-out', str(CA_CERT)], timeout=120)
+        renew_server = True
+    if renew_server or not SERVER_CERT.exists() or not SERVER_KEY.exists():
+        csr = CERT_DIR / 'server.csr'
+        ext = CERT_DIR / 'server.ext'
+        ip = server_ip()
+        atomic_write(ext, f'''basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:{server_name},IP:{ip}\n''', 0o640, 'root', 'freerad')
+        run(['/usr/bin/openssl', 'req', '-new', '-newkey', 'rsa:3072', '-nodes', '-sha256',
+             '-subj', f'/O=KIRSS/CN={server_name}', '-keyout', str(SERVER_KEY), '-out', str(csr)], timeout=120)
+        run(['/usr/bin/openssl', 'x509', '-req', '-in', str(csr), '-CA', str(CA_CERT), '-CAkey', str(CA_KEY),
+             '-CAcreateserial', '-out', str(SERVER_CERT), '-days', '825', '-sha256', '-extfile', str(ext)], timeout=120)
+        csr.unlink(missing_ok=True)
+    for path, mode in ((CA_KEY, 0o640), (SERVER_KEY, 0o640), (CA_CERT, 0o644), (SERVER_CERT, 0o644)):
+        os.chmod(path, mode)
+        shutil.chown(path, user='root', group='freerad')
+
+
+def server_ip():
+    result = run(['/usr/sbin/ip', '-4', '-j', 'addr', 'show', 'br0'], False)
+    try:
+        data = json.loads(result.stdout)
+        return next(x['local'] for x in data[0]['addr_info'] if x['family'] == 'inet')
+    except Exception:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(('1.1.1.1', 53))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+
+
+def configure(config, restart=True):
+    files = [CLIENTS_FILE, MSCHAP_FILE, PAP_FILE, LOG_FILE, SITE_FILE, EAP_FILE, ROOT / 'clients.conf']
+    backups = {path: path.read_bytes() if path.exists() else None for path in files}
+    try:
+        ensure_certificate(config['server_name'])
+        ensure_eap()
+        ensure_clients_include(config)
+        atomic_write(CLIENTS_FILE, render_clients(config), 0o640, 'root', 'freerad')
+        atomic_write(MSCHAP_FILE, render_mschap(config), 0o640, 'root', 'freerad')
+        atomic_write(PAP_FILE, render_pap(config), 0o640, 'root', 'freerad')
+        atomic_write(LOG_FILE, render_log_module(), 0o640, 'root', 'freerad')
+        atomic_write(SITE_FILE, render_site(config), 0o640, 'root', 'freerad')
+        for name in ('cockpit_ad_pap', 'cockpit_radius_log'):
+            link = ROOT / 'mods-enabled' / name
+            if not link.exists():
+                link.symlink_to(Path('../mods-available') / name)
+        default_link = ROOT / 'sites-enabled/default'
+        default_link.unlink(missing_ok=True)
+        site_link = ROOT / 'sites-enabled/cockpit-radius'
+        if not site_link.exists():
+            site_link.symlink_to('../sites-available/cockpit-radius')
+        ensure_samba_mschap()
+        check = run(['/usr/sbin/freeradius', '-XC'], False, 60)
+        if check.returncode:
+            raise RuntimeError((check.stderr or check.stdout).strip())
+        save_config(config)
+        if restart:
+            run(['/usr/bin/systemctl', 'restart', 'freeradius'])
+    except Exception:
+        for path, content in backups.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(content)
+        raise
+
+
+def service_active():
+    return run(['/usr/bin/systemctl', 'is-active', 'freeradius'], False).returncode == 0
+
+
+def service_enabled():
+    return run(['/usr/bin/systemctl', 'is-enabled', 'freeradius'], False).returncode == 0
+
+
+def config_check():
+    result = run(['/usr/sbin/freeradius', '-XC'], False, 60)
+    return result.returncode == 0, (result.stderr or result.stdout)
+
+
+def listening(port):
+    text = run(['/usr/bin/ss', '-lun'], False).stdout
+    return bool(re.search(rf':{int(port)}\s', text))
+
+
+def certificate_info():
+    if not SERVER_CERT.exists():
+        return {'common_name': '', 'issuer': '', 'not_before': '', 'not_after': '', 'days_left': 0, 'fingerprint': ''}
+    output = run(['/usr/bin/openssl', 'x509', '-in', str(SERVER_CERT), '-noout', '-subject', '-issuer', '-dates', '-fingerprint', '-sha256']).stdout
+    values = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+    cn = re.search(r'CN\s*=\s*([^,]+)', values.get('subject', ''))
+    end = datetime.datetime.strptime(values['notAfter'], '%b %d %H:%M:%S %Y %Z').replace(tzinfo=datetime.timezone.utc)
+    return {'common_name': cn.group(1) if cn else values.get('subject', ''), 'issuer': values.get('issuer', ''),
+            'not_before': values.get('notBefore', ''), 'not_after': values.get('notAfter', ''),
+            'days_left': max(0, (end - datetime.datetime.now(datetime.timezone.utc)).days),
+            'fingerprint': values.get('sha256 Fingerprint', '')}
+
+
+def tail(path, lines=120):
+    if not path.exists():
+        return ''
+    return '\n'.join(path.read_text(errors='replace').splitlines()[-lines:])
+
+
+def activity():
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
+    visible = []
+    accepts = rejects = 0
+    if AUTH_LOG.exists():
+        for line in AUTH_LOG.read_text(errors='replace').splitlines():
+            if ('user=codex-radius-' in line or 'user=definitely-no-such-user' in line or
+                    ('nas=127.0.0.1' in line and 'station=02-00-00-00-00-01' in line)):
+                continue
+            stamp = re.search(r'^time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+            if stamp:
+                try:
+                    if datetime.datetime.strptime(stamp.group(1), '%Y-%m-%d %H:%M:%S') < cutoff:
+                        continue
+                except ValueError:
+                    pass
+            visible.append(line)
+            if 'result=Access-Accept' in line:
+                accepts += 1
+            elif 'result=Access-Reject' in line:
+                rejects += 1
+    accounting = 0
+    if ACCT_LOG.exists():
+        for line in ACCT_LOG.read_text(errors='replace').splitlines():
+            if 'user=codex-radius-' in line:
+                continue
+            stamp = re.search(r'^time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
+            if stamp:
+                try:
+                    if datetime.datetime.strptime(stamp.group(1), '%Y-%m-%d %H:%M:%S') < cutoff:
+                        continue
+                except ValueError:
+                    pass
+            accounting += 1
+    service_log = run(['/usr/bin/journalctl', '-u', 'freeradius', '-n', '100', '--no-pager'], False).stdout
+    return {'accepts': accepts, 'rejects': rejects, 'accounting': accounting,
+            'auth_log': '\n'.join(visible[-200:]), 'service_log': service_log[-24000:]}
+
+
+def status():
+    config = load_config()
+    ok, _ = config_check()
+    domain = domain_info()
+    wb = run(['/usr/bin/wbinfo', '-p'], False).returncode == 0
+    version = run(['/usr/sbin/freeradius', '-v'], False).stdout.splitlines()[0].replace('FreeRADIUS Version ', '')
+    return {'settings': {k: v for k, v in config.items() if k != 'local_secret' and k != 'clients'},
+            'clients': config['clients'], 'domain': domain,
+            'ad': {'winbind': wb, 'groups': ad_groups(), 'members': group_member_count(config['allowed_group'])},
+            'service': {'active': service_active(), 'enabled': service_enabled(), 'config_ok': ok, 'version': version,
+                        'auth_listening': listening(config['auth_port']), 'accounting_listening': listening(config['accounting_port'])},
+            'server': {'ip': server_ip()}, 'certificate': certificate_info(), 'activity': activity()}
+
+
+def auth_test(request):
+    username = str(request.get('username') or '').strip()
+    password = str(request.get('password') or '')
+    method = str(request.get('method') or 'mschap')
+    if not re.fullmatch(r'[A-Za-z0-9._+@\-]{1,128}', username) or not password or len(password) > 256 or any(char in password for char in '\r\n\x00'):
+        raise ValueError('Sisesta korrektne kasutajanimi ja parool')
+    if method not in ('pap', 'mschap', 'peap'):
+        raise ValueError('Tundmatu autentimismeetod')
+    config = load_config()
+    if method == 'peap':
+        def quote(value):
+            return str(value).replace('\\', '\\\\').replace('"', '\\"')
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile('w', prefix='cockpit-radius-eap-', suffix='.conf', dir='/run', delete=False) as handle:
+                handle.write('network={\n    key_mgmt=WPA-EAP\n    eap=PEAP\n')
+                handle.write(f'    identity="{quote(username)}"\n    anonymous_identity="anonymous@{quote(domain_info()["realm"].lower())}"\n')
+                handle.write(f'    password="{quote(password)}"\n    phase2="auth=MSCHAPV2"\n')
+                handle.write(f'    ca_cert="{CA_CERT}"\n    domain_suffix_match="{quote(config["server_name"])}"\n}}\n')
+                path = handle.name
+            os.chmod(path, 0o600)
+            result = run(['/usr/bin/eapol_test', '-c', path, '-a', '127.0.0.1', '-p', str(config['auth_port']),
+                          '-s', localhost_secret(), '-t', '15'], False, 25)
+        finally:
+            if path:
+                Path(path).unlink(missing_ok=True)
+        output = (result.stdout + '\n' + result.stderr).strip()
+        success = bool(re.search(r'^SUCCESS$', output, re.M))
+        reason = 'PEAP, EAP‑MSCHAPv2, sertifikaat ja AD grupiliikmesus on korras.' if success else 'Kontrolli parooli, konto olekut, AD grupiliikmesust ja EAP seadistust.'
+        detail = 'EAP autentimine õnnestus' if success else 'EAP autentimine keelati'
+        audit('auth_test_peap', username, success)
+        return {'success': success, 'message': reason, 'detail': detail}
+    args = ['/usr/bin/radtest']
+    if method == 'mschap':
+        args += ['-t', 'mschap']
+    args += [username, password, '127.0.0.1', '0', localhost_secret()]
+    result = run(args, False, 30)
+    output = (result.stdout + '\n' + result.stderr).strip()
+    success = bool(re.search(r'^Received Access-Accept\b', output, re.M))
+    reason = 'Kasutaja parool ja AD grupiliikmesus on korras.' if success else 'Kontrolli parooli, konto olekut ja liikmesust lubatud AD grupis.'
+    detail = next((line.strip() for line in output.splitlines() if line.startswith('Received Access-')), '')
+    audit('auth_test', username, success)
+    return {'success': success, 'message': reason, 'detail': detail}
+
+
+def diagnostics():
+    config = load_config()
+    ok, check = config_check()
+    tests = [
+        ('FreeRADIUS konfiguratsioon', ok, check.strip().splitlines()[-1] if check.strip() else ''),
+        ('FreeRADIUS teenus', service_active(), run(['/usr/bin/systemctl', 'is-active', 'freeradius'], False).stdout.strip()),
+        ('Samba winbind', run(['/usr/bin/wbinfo', '-p'], False).returncode == 0, run(['/usr/bin/wbinfo', '-p'], False).stdout.strip()),
+        ('AD grupp', bool(config.get('group_sid')), f"{config.get('allowed_group')} · {config.get('group_sid')}"),
+        ('UDP autentimine', listening(config['auth_port']), f"0.0.0.0:{config['auth_port']}"),
+        ('UDP accounting', listening(config['accounting_port']), f"0.0.0.0:{config['accounting_port']}"),
+        ('EAP sertifikaat', CERT_DIR.exists() and certificate_info()['days_left'] > 0, f"{certificate_info()['days_left']} päeva"),
+    ]
+    return '\n'.join(f"{'✓' if passed else '✕'} {name}: {detail}" for name, passed, detail in tests)
+
+
+def main(request):
+    action = request.get('action', '')
+    if action == 'status':
+        return status()
+    if action == 'generate_secret':
+        return {'secret': generate_secret()}
+    if action == 'settings_save':
+        config = load_config()
+        group, sid, gid = validate_group(request.get('allowed_group'))
+        host = str(request.get('server_name') or '').strip().lower()
+        if not SAFE_HOST.fullmatch(host):
+            raise ValueError('RADIUS serveri nimi ei ole korrektne DNS-nimi')
+        config.update({'allowed_group': group, 'group_sid': sid, 'group_gid': gid, 'server_name': host,
+                       'auth_port': validate_port(request.get('auth_port'), 'Autentimisport'),
+                       'accounting_port': validate_port(request.get('accounting_port'), 'Accounting port')})
+        if config['auth_port'] == config['accounting_port']:
+            raise ValueError('Autentimis- ja accounting port peavad olema erinevad')
+        configure(config)
+        audit(action, group)
+        return {'message': f'Ligipääs on piiratud AD grupiga {group}.'}
+    if action in ('client_add', 'client_update'):
+        config = load_config()
+        if action == 'client_add' and request.get('secret') == '__generate__':
+            request = {**request, 'secret': generate_secret()}
+        client = validate_client(request)
+        if action == 'client_add':
+            if any(x['ipaddr'] == client['ipaddr'] for x in config['clients']):
+                raise ValueError('Selle IP-aadressi või võrguga klient on juba olemas')
+            config['clients'].append(client)
+        else:
+            cid = str(request.get('id') or '')
+            index = next((i for i, item in enumerate(config['clients']) if item['id'] == cid), None)
+            if index is None:
+                raise ValueError('RADIUS klienti ei leitud')
+            client['id'] = cid
+            config['clients'][index] = client
+        configure(config)
+        audit(action, client['name'])
+        return {'message': f"RADIUS klient {client['name']} salvestati."}
+    if action == 'client_delete':
+        config = load_config()
+        cid = str(request.get('id') or '')
+        client = next((x for x in config['clients'] if x['id'] == cid), None)
+        if not client or request.get('confirm') != client['name']:
+            raise ValueError('Kustutamise kinnitus ei ühti')
+        config['clients'] = [x for x in config['clients'] if x['id'] != cid]
+        configure(config)
+        audit(action, client['name'])
+        return {'message': f"RADIUS klient {client['name']} kustutati."}
+    if action == 'auth_test':
+        return auth_test(request)
+    if action == 'diagnostics':
+        return {'output': diagnostics()}
+    if action == 'restart':
+        ok, output = config_check()
+        if not ok:
+            raise RuntimeError(output)
+        run(['/usr/bin/systemctl', 'restart', 'freeradius'])
+        audit(action, 'freeradius')
+        return {'message': 'FreeRADIUS taaskäivitati.'}
+    if action == 'certificate_download':
+        return {'filename': 'KIRSS-RADIUS-CA.pem', 'content': base64.b64encode(CA_CERT.read_bytes()).decode()}
+    if action == 'certificate_renew':
+        if request.get('confirm') != 'GENEREERI':
+            raise ValueError('Kinnitus ei ühti')
+        config = load_config()
+        ensure_certificate(config['server_name'], True)
+        ok, output = config_check()
+        if not ok:
+            raise RuntimeError(output)
+        run(['/usr/bin/systemctl', 'restart', 'freeradius'])
+        audit(action, config['server_name'])
+        return {'message': 'EAP serveri sertifikaat genereeriti ja teenus taaskäivitati.'}
+    raise ValueError('Tundmatu toiming')
+
+
+if __name__ == '__main__':
+    try:
+        request = json.loads(sys.stdin.read() or '{}')
+        print(json.dumps(main(request), ensure_ascii=False))
+    except Exception as error:
+        print(json.dumps({'error': str(error)}, ensure_ascii=False))
+        sys.exit(1)

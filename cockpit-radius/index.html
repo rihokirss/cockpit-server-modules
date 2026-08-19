@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="et">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RADIUS</title>
+  <link rel="stylesheet" href="../base1/patternfly.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="../base1/cockpit.js"></script>
+</head>
+<body>
+  <div id="toast" class="toast hidden"></div>
+  <header>
+    <div><span class="eyebrow">VÕRGU AUTENTIMINE</span><h1>RADIUS</h1><p id="subtitle">FreeRADIUS · Samba Active Directory</p></div>
+    <div class="header-actions"><span id="health" class="status loading">Kontrollin</span><button id="refresh" class="header-button">↻ Värskenda</button></div>
+  </header>
+  <nav id="nav">
+    <button class="active" data-view="overview">Ülevaade</button>
+    <button data-view="clients">RADIUS kliendid</button>
+    <button data-view="access">Ligipääs</button>
+    <button data-view="certificate">Sertifikaat</button>
+    <button data-view="test">Testimine</button>
+    <button data-view="logs">Logid</button>
+    <button data-view="unifi">UniFi juhend</button>
+  </nav>
+  <main>
+    <div id="loading" class="loading"><span class="spinner"></span><span>Laen RADIUS serveri olekut…</span></div>
+    <section id="content" class="hidden"></section>
+  </main>
+
+  <dialog id="form-dialog"><form id="dynamic-form">
+    <div class="dialog-head"><div><span id="dialog-kicker" class="eyebrow"></span><h2 id="dialog-title"></h2><p id="dialog-description"></p></div><button type="button" class="icon-button" data-close>×</button></div>
+    <div id="form-fields"></div>
+    <div class="dialog-actions"><button type="button" class="button" data-close>Loobu</button><button id="form-submit" class="button primary">Salvesta</button></div>
+  </form></dialog>
+
+  <dialog id="detail-dialog">
+    <div class="dialog-head"><div><span class="eyebrow">DETAILID</span><h2 id="detail-title"></h2></div><button type="button" class="icon-button" data-close-detail>×</button></div>
+    <div id="detail-content"></div>
+    <div class="dialog-actions"><button class="button" data-close-detail>Sulge</button></div>
+  </dialog>
+
+  <dialog id="confirm-dialog"><form id="confirm-form">
+    <div class="danger-icon">!</div><h2 id="confirm-title"></h2><p id="confirm-text"></p>
+    <label id="confirm-label" class="field"><span id="confirm-prompt">Sisesta kinnituseks nimi</span><input id="confirm-input" autocomplete="off"></label>
+    <div class="dialog-actions"><button type="button" class="button" data-close-confirm>Loobu</button><button id="confirm-submit" class="button danger">Kinnita</button></div>
+  </form></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

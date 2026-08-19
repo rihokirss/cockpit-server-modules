@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sertifikaadid</title>
+  <link rel="stylesheet" href="../base1/patternfly.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="../base1/cockpit.js"></script>
+</head>
+<body>
+  <main>
+    <header class="top">
+      <div><h1>Sertifikaadid</h1><p class="muted">Let's Encrypti elutsükkel ja turvaline edastus teenustesse</p></div>
+      <div class="header-actions"><span id="status" class="badge">Laen…</span><button id="refresh" class="btn icon-btn" title="Värskenda">↻ <span>Värskenda</span></button></div>
+    </header>
+    <div id="message" class="message hidden" role="status"></div>
+
+    <section class="summary" aria-label="Kokkuvõte">
+      <div class="metric"><span class="metric-icon green">✓</span><div><strong id="valid-count">–</strong><small>kehtivat sertifikaati</small></div></div>
+      <div class="metric"><span class="metric-icon blue">↻</span><div><strong id="renewal-summary">–</strong><small>automaatne uuendamine</small></div></div>
+      <div class="metric"><span class="metric-icon purple">⇥</span><div><strong id="deploy-count">–</strong><small>Synology edastust</small></div></div>
+    </section>
+
+    <section class="card">
+      <div class="section-head"><div><h2>Sertifikaadid</h2><p class="muted">Kõik serveris olevad Let's Encrypti sertifikaadid</p></div><button id="add" class="btn primary">+ Taotle sertifikaat</button></div>
+      <div id="certificates" class="certificate-list"></div>
+      <div id="empty" class="empty hidden"><strong>Sertifikaate pole</strong><span>Taotle esimene sertifikaat, et teenus HTTPS-iga kaitsta.</span></div>
+    </section>
+
+    <div class="two-column">
+      <section class="card compact">
+        <div class="section-head"><div><h2>Automaatne uuendamine</h2><p id="next-run" class="muted">Kontrollin ajakava…</p></div><label class="switch"><input id="renewal-toggle" type="checkbox"><span></span></label></div>
+        <div class="card-footer"><span>Certbot kontrollib vajadust kaks korda päevas</span><button id="renew-all" class="btn">Kontrolli kohe</button></div>
+      </section>
+      <section class="card compact">
+        <div class="section-head"><div><h2>Synology DSM</h2><p id="synology-summary" class="muted">Seadistamata</p></div><span id="synology-state" class="dot neutral"></span></div>
+        <div class="card-footer"><span>Sertifikaadid uuenevad DSM-is automaatselt</span><button id="synology-settings" class="btn">Seadista</button></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="section-head"><div><h2>Sündmuste logi</h2><p class="muted">Väljastamine, uuendamine ja edastamine</p></div><button id="logs-refresh" class="btn">Värskenda</button></div>
+      <pre id="logs">Laen…</pre>
+    </section>
+  </main>
+
+  <dialog id="issue-dialog">
+    <form id="issue-form">
+      <div class="dialog-title"><div><h2 id="issue-title">Taotle sertifikaat</h2><p class="muted">Let's Encrypt kontrollib iga nime selle serveri pordi 80 kaudu.</p></div><button type="button" class="close" data-close="issue-dialog">×</button></div>
+      <input id="cert-name" type="hidden">
+      <label>Domeeninimed</label>
+      <div class="domain-entry"><input id="domain-input" placeholder="nas.example.com" autocomplete="off"><button id="domain-add" type="button" class="btn">Lisa</button></div>
+      <div id="domain-chips" class="chips"></div>
+      <p class="hint">Esimene domeen saab sertifikaadi põhinimeks. Lisa SAN-nimed eraldi.</p>
+      <div class="info-box">TCP port 80 peab internetist jõudma sellesse serverisse. Väljastatakse Synologyga ühilduv RSA 2048 sertifikaat.</div>
+      <div class="dialog-actions"><button type="button" class="btn" data-close="issue-dialog">Loobu</button><button class="btn primary">Taotle ja paigalda</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="synology-dialog">
+    <form id="synology-form">
+      <div class="dialog-title"><div><h2>Synology DSM-i ühendus</h2><p class="muted">Andmed salvestatakse ainult root-kasutajale loetavasse faili.</p></div><button type="button" class="close" data-close="synology-dialog">×</button></div>
+      <div class="grid3">
+        <label>Aadress<input id="synology-host" required placeholder="192.168.1.10"></label>
+        <label>Port<input id="synology-port" type="number" min="1" max="65535" required value="5001"></label>
+        <label>Protokoll<select id="synology-https"><option value="true">HTTPS</option><option value="false">HTTP</option></select></label>
+      </div>
+      <div class="grid2">
+        <label>Kasutajanimi<input id="synology-username" required autocomplete="username"></label>
+        <label>Parool<input id="synology-password" type="password" autocomplete="new-password" placeholder="Salvestatud parooli ei kuvata"></label>
+      </div>
+      <label class="check"><input id="synology-verify" type="checkbox"> Kontrolli DSM-i TLS-sertifikaati</label>
+      <p class="hint">IP-aadressi ja DSM-i enda sertifikaadi korral jäta kontroll välja. Konto peab kuuluma DSM-i administraatorite gruppi ning soovitatavalt ei kasuta 2FA-d.</p>
+      <div id="synology-test-result" class="inline-result hidden"></div>
+      <div class="dialog-actions split"><button id="synology-test" type="button" class="btn">Testi ühendust</button><span></span><button type="button" class="btn" data-close="synology-dialog">Loobu</button><button class="btn primary">Salvesta</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="deployment-dialog">
+    <form id="deployment-form">
+      <div class="dialog-title"><div><h2>Synology edastus</h2><p id="deployment-name" class="muted"></p></div><button type="button" class="close" data-close="deployment-dialog">×</button></div>
+      <input id="deployment-cert" type="hidden">
+      <div class="toggle-row"><span><strong>Automaatne edastamine</strong><small>Pärast iga edukat Certboti uuendust</small></span><label class="switch"><input id="deployment-enabled" type="checkbox"><span></span></label></div>
+      <label>DSM-i sertifikaadi kirjeldus<input id="deployment-description" maxlength="128" required></label>
+      <p class="hint">Moodul asendab edaspidi sama kirjeldusega sertifikaati. Nii säilivad DSM-i teenuste seosed.</p>
+      <label class="check"><input id="deployment-default" type="checkbox"> Määra DSM-i vaikimisi sertifikaadiks</label>
+      <div class="dialog-actions split"><button id="deploy-now" type="button" class="btn">Edasta kohe</button><span></span><button type="button" class="btn" data-close="deployment-dialog">Loobu</button><button class="btn primary">Salvesta</button></div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

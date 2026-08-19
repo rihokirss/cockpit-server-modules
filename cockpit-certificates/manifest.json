@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "requires": { "cockpit": "300" },
+  "menu": {
+    "index": {
+      "label": "Sertifikaadid",
+      "order": 74,
+      "keywords": [ { "matches": [ "certificate", "certbot", "letsencrypt", "acme", "synology", "tls", "https" ] } ]
+    }
+  }
+}

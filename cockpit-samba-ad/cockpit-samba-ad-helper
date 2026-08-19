@@ -1,0 +1,290 @@
+#!/usr/bin/python3
+import base64, datetime, json, os, re, shutil, subprocess, sys, tempfile
+from pathlib import Path
+
+SAMBA='/usr/bin/samba-tool'; BACKUPS=Path('/var/backups/samba-ad'); AUDIT=Path('/var/log/cockpit-samba-ad-audit.jsonl')
+SAFE_NAME=re.compile(r'^[\w .@()\-+]{1,128}$',re.UNICODE); DNS_NAME=re.compile(r'^[A-Za-z0-9_.*@-]{1,253}$'); ZONE=re.compile(r'^(?=.{1,253}$)[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+\.?$')
+
+def run(args,check=True,timeout=90,cwd=None,input_text=None):
+    p=subprocess.run(args,text=True,input=input_text,capture_output=True,timeout=timeout,cwd=cwd,env={**os.environ,'LANG':'C.UTF-8','LC_ALL':'C.UTF-8'})
+    if check and p.returncode: raise RuntimeError((p.stderr or p.stdout).strip() or f'{args[0]} ebaõnnestus')
+    return p
+def samba(*args,check=True,timeout=90): return run([SAMBA,*map(str,args),'--color=never'],check,timeout)
+def samba_auth(req,args,timeout=180,cwd=None):
+    user=valid_name(req.get('admin_user'),'Administraator');password=str(req.get('admin_password') or '')
+    if not password:raise ValueError('Domeeniadministraatori parool on kohustuslik')
+    info=domain_info(); path=None
+    try:
+        with tempfile.NamedTemporaryFile('w',prefix='cockpit-samba-auth-',dir='/run',delete=False) as f:
+            f.write(f"username = {user}\npassword = {password}\ndomain = {info['netbios']}\n");path=f.name
+        os.chmod(path,0o600)
+        return run([SAMBA,*args,'-H','ldap://127.0.0.1','--use-kerberos=off','-A',path,'--color=never'],timeout=timeout,cwd=cwd)
+    finally:
+        if path:
+            try:os.unlink(path)
+            except FileNotFoundError:pass
+def lines(cmd): return [x.strip() for x in cmd.stdout.splitlines() if x.strip()]
+def valid_name(v,label='Nimi'):
+    v=str(v or '').strip()
+    if not SAFE_NAME.fullmatch(v) or any(c in v for c in '\n\r,/\\'): raise ValueError(f'{label} sisaldab lubamatuid märke')
+    return v
+def valid_zone(v):
+    v=str(v or '').strip().lower().rstrip('.')
+    if not ZONE.fullmatch(v): raise ValueError('Vigane DNS-tsoon')
+    return v
+def valid_gpo(v):
+    v=str(v or '').strip().upper()
+    if not re.fullmatch(r'\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}',v):raise ValueError('Vigane GPO GUID')
+    return v
+def ldif(text):
+    attrs={}; last=None
+    for raw in text.splitlines():
+        if raw.startswith(' ') and last: attrs[last][-1]+=raw[1:]; continue
+        if ': ' not in raw: continue
+        k,v=raw.split(': ',1); attrs.setdefault(k,[]).append(v); last=k
+    return {k:(v[0] if len(v)==1 else v) for k,v in attrs.items()}
+def ldif_records(text):
+    return [ldif(block) for block in re.split(r'\n\s*\n',text) if 'dn: ' in block]
+def ldb(filter_expr,*attrs):
+    return ldif_records(run(['/usr/bin/ldbsearch','-H','/var/lib/samba/private/sam.ldb',filter_expr,*attrs]).stdout)
+def audit(action,target='',ok=True):
+    try:
+        AUDIT.parent.mkdir(parents=True,exist_ok=True); rec={'time':datetime.datetime.now(datetime.timezone.utc).isoformat(),'user':os.getenv('COCKPIT_USER') or os.getenv('USER','unknown'),'action':action,'target':target,'ok':ok}
+        with AUDIT.open('a') as f: f.write(json.dumps(rec,ensure_ascii=False)+'\n')
+        os.chmod(AUDIT,0o600)
+    except Exception: pass
+def audit_items(limit=100):
+    if not AUDIT.exists():return []
+    out=[]
+    for line in AUDIT.read_text(errors='replace').splitlines()[-limit:][::-1]:
+        try:out.append(json.loads(line))
+        except json.JSONDecodeError:pass
+    return out
+def modify_attr(dn,name,value):
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9-]*',name):raise ValueError('Vigane atribuudi nimi')
+    text=f'dn: {dn}\nchangetype: modify\n'
+    if value=='':text+=f'delete: {name}\n'
+    else:
+        encoded=base64.b64encode(value.encode()).decode();text+=f'replace: {name}\n{name}:: {encoded}\n'
+    text+='-\n'
+    run(['/usr/bin/ldbmodify','-H','/var/lib/samba/private/sam.ldb'],input_text=text)
+def service_active(): return run(['/bin/systemctl','is-active','samba-ad-dc'],False).returncode==0
+def domain_info():
+    text=samba('domain','info','127.0.0.1').stdout; m={}
+    for line in text.splitlines():
+        if ':' in line:
+            k,v=line.split(':',1);m[k.strip()]=v.strip()
+    level=samba('domain','level','show').stdout
+    lm=re.search(r'Domain function level:\s*(.+)',level)
+    return {'realm':m.get('Forest',''),'netbios':m.get('Netbios domain',''),'dc':m.get('DC name',''),'site':m.get('Server site',''),'level':lm.group(1) if lm else '—','version':run(['/usr/sbin/samba','--version']).stdout.strip().removeprefix('Version ')}
+def dns_zones():
+    text=samba('dns','zonelist','127.0.0.1','-P').stdout
+    return sorted(set(re.findall(r'pszZoneName\s*:\s*([^\s]+)',text)),key=str.lower)
+def attr(name,kind='user'):
+    return ldif(samba(kind,'show',name).stdout)
+def disabled(a):
+    try:return bool(int(a.get('userAccountControl','0'))&2)
+    except:return False
+def user_items():
+    out=[{'name':a.get('sAMAccountName',''),'display':a.get('displayName',''),'disabled':disabled(a)} for a in ldb('(&(objectClass=user)(!(objectClass=computer)))','sAMAccountName','displayName','userAccountControl') if a.get('sAMAccountName')]
+    return sorted(out,key=lambda x:x['name'].lower())
+def group_items():
+    out=[]
+    for a in ldb('(objectClass=group)','sAMAccountName','description','groupType'):
+        if not a.get('sAMAccountName'):continue
+        gt=int(a.get('groupType','0')); scope='Universal' if gt&8 else ('Domain local' if gt&4 else 'Global');out.append({'name':a['sAMAccountName'],'description':a.get('description',''),'scope':scope})
+    return sorted(out,key=lambda x:x['name'].lower())
+def computer_items():
+    out=[{'name':a.get('sAMAccountName','').rstrip('$'),'os':a.get('operatingSystem',''),'disabled':disabled(a)} for a in ldb('(objectClass=computer)','sAMAccountName','operatingSystem','userAccountControl') if a.get('sAMAccountName')]
+    return sorted(out,key=lambda x:x['name'].lower())
+def ou_items():
+    vals=lines(samba('ou','list','--full-dn'))
+    return [{'name':re.match(r'OU=([^,]+)',x,re.I).group(1) if re.match(r'OU=([^,]+)',x,re.I) else x,'dn':x} for x in vals]
+def replication():
+    raw=samba('drs','showrepl').stdout; failures=sum(map(int,re.findall(r'(\d+) consecutive failure',raw))); parts=len(re.findall(r'^DC=|^CN=Schema|^CN=Configuration',raw,re.M)); partners=re.findall(r'\\([^\\\s]+) via RPC',raw)
+    return {'raw':raw,'failures':failures,'partitions':parts,'partner':partners[0] if partners else '','healthy':failures==0 and 'was successful' in raw}
+def fsmo():
+    raw=samba('fsmo','show').stdout; out=[]
+    for line in raw.splitlines():
+        if ':' in line:
+            role,dn=line.split(':',1); m=re.search(r'CN=([^,]+),CN=Servers',dn);out.append({'role':role.replace('Role owner','').strip(),'owner':m.group(1) if m else dn.strip()})
+    return out
+def parse_gpo():
+    raw=samba('gpo','listall','-H','ldap://127.0.0.1').stdout; items=[]
+    for block in re.split(r'\n\s*\n',raw):
+        a={}
+        for line in block.splitlines():
+            if ':' in line:
+                k,v=line.split(':',1);a[k.strip().lower()]=v.strip()
+        guid=a.get('gpo') or a.get('name')
+        if guid: items.append({'name':guid,'display':a.get('display name',guid),'dn':a.get('dn','')})
+    return {'items':items,'raw':raw}
+def backups():
+    if not BACKUPS.exists():return []
+    out=[]
+    for p in sorted(BACKUPS.iterdir(),key=lambda x:x.stat().st_mtime,reverse=True):
+        if p.is_file():out.append({'name':p.name,'size':f'{p.stat().st_size/1048576:.1f} MB','modified':datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M')})
+    return out
+def backup_path(name):
+    name=str(name or '').strip()
+    if not re.fullmatch(r'samba-backup-[A-Za-z0-9_.-]+\.tar\.bz2',name):raise ValueError('Vigane varukoopia nimi')
+    p=BACKUPS/name
+    if not p.is_file() or p.parent.resolve()!=BACKUPS.resolve():raise ValueError('Varukoopiat ei leitud')
+    return p
+def principal_from_dn(dn):
+    raw=run(['/usr/bin/ldbsearch','-H','/var/lib/samba/private/sam.ldb','-b',dn,'-s','base','sAMAccountName','objectClass'],False).stdout
+    a=ldif(raw); classes=a.get('objectClass',[]);classes=[classes] if isinstance(classes,str) else classes
+    typ='computer' if 'computer' in classes else ('group' if 'group' in classes else 'user')
+    name=a.get('sAMAccountName','').rstrip('$')
+    return {'name':name,'type':typ} if name else None
+def group_members_data(group):
+    g=valid_name(group,'Grupp');a=attr(g,'group');dns=a.get('member',[]);dns=[dns] if isinstance(dns,str) else dns
+    current=[x for x in (principal_from_dn(dn) for dn in dns) if x]
+    candidates=[]
+    candidates += [{'name':x['name'],'label':x.get('display') or x['name'],'type':'user'} for x in user_items()]
+    candidates += [{'name':x['name'],'label':x['name'],'type':'group'} for x in group_items() if x['name']!=g]
+    candidates += [{'name':x['name'],'label':x['name'],'type':'computer'} for x in computer_items()]
+    return {'group':g,'current':current,'candidates':sorted(candidates,key=lambda x:(x['type'],x['label'].lower()))}
+def require(req,*keys):
+    for k in keys:
+        if req.get(k) is None or str(req[k]).strip()=='':raise ValueError(f'Väli {k} on kohustuslik')
+def mutate(action,target,args,timeout=90):
+    try:p=samba(*args,timeout=timeout);audit(action,target);return {'message':(p.stdout or p.stderr).strip() or 'Toiming lõpetatud.'}
+    except Exception:audit(action,target,False);raise
+
+def main(req):
+    a=req.get('action','')
+    if a=='overview':
+        d=domain_info(); users=user_items(); groups=group_items(); comps=computer_items(); zones=dns_zones(); rep=replication()
+        return {'domain':d,'service':{'active':service_active()},'counts':{'users':len(users),'disabled':sum(x['disabled'] for x in users),'groups':len(groups),'computers':len(comps),'zones':len(zones)},'replication':rep,'fsmo':fsmo()}
+    if a=='users':return {'items':user_items()}
+    if a=='groups':return {'items':group_items()}
+    if a=='computers':return {'items':computer_items()}
+    if a=='ous':return {'items':ou_items()}
+    if a=='dns':return {'zones':dns_zones()}
+    if a=='gpo':return parse_gpo()
+    if a=='replication':return replication()
+    if a=='operations':
+        logs=run(['/usr/bin/journalctl','-u','samba-ad-dc','-n','100','--no-pager'],False).stdout
+        return {'service_status':'aktiivne' if service_active() else 'peatatud','backups':backups(),'logs':logs[-24000:],'audit':audit_items()}
+    if a=='detail':
+        kind=req.get('kind'); name=valid_gpo(req.get('name')) if kind=='gpo' else valid_name(req.get('name'))
+        mapping={'users':'user','groups':'group','computers':'computer'}
+        if kind in mapping:return {'attributes':attr(name,mapping[kind])}
+        if kind=='ous':return {'attributes':{'dn':next((x['dn'] for x in ou_items() if x['name']==name),name)}}
+        if kind=='gpo':return {'attributes':next((x for x in parse_gpo()['items'] if x['name']==name),{'name':name})}
+        raise ValueError('Selle objekti detailvaade pole toetatud')
+    if a=='user_create':
+        require(req,'username','password');n=valid_name(req['username'],'Kasutajanimi');args=['user','create',n,str(req['password'])]
+        for key,opt in [('given_name','--given-name'),('surname','--surname'),('email','--mail-address')]:
+            if req.get(key):args.append(f'{opt}={str(req[key]).strip()}')
+        if req.get('must_change'):args.append('--must-change-at-next-login')
+        return mutate(a,n,args)
+    if a in ('user_enable','user_disable','user_unlock','user_delete'):
+        n=valid_name(req.get('name'));verb={'user_enable':'enable','user_disable':'disable','user_unlock':'unlock','user_delete':'delete'}[a];return mutate(a,n,['user',verb,n])
+    if a=='user_password':
+        require(req,'name','password');n=valid_name(req['name']);args=['user','setpassword',n,f"--newpassword={req['password']}"]
+        if req.get('must_change'):args.append('--must-change-at-next-login')
+        return mutate(a,n,args)
+    if a=='user_update':
+        require(req,'name');n=valid_name(req['name']);args=['user','rename',n]
+        for key,opt in [('given_name','--given-name'),('surname','--surname'),('display_name','--display-name'),('email','--mail-address')]:args.append(f"{opt}={str(req.get(key,'')).strip()}")
+        return mutate(a,n,args)
+    if a=='group_create':
+        require(req,'name');n=valid_name(req['name']);args=['group','add',n,f"--group-scope={str(req.get('scope','Global')).title()}",f"--group-type={str(req.get('type','Security')).title()}"]
+        if req.get('description'):args.append(f"--description={str(req['description']).strip()}")
+        return mutate(a,n,args)
+    if a=='group_delete':n=valid_name(req.get('name'));return mutate(a,n,['group','delete',n])
+    if a=='group_update':
+        require(req,'name');g=valid_name(req['name']);aobj=attr(g,'group');modify_attr(aobj['dn'],'description',str(req.get('description','')).strip());audit(a,g);return {'message':'Grupi kirjeldus uuendatud.'}
+    if a=='group_members_get':return group_members_data(req.get('group'))
+    if a=='group_members_set':
+        g=valid_name(req.get('group'),'Grupp');desired=req.get('members',[])
+        if not isinstance(desired,list) or len(desired)>1000:raise ValueError('Vigane liikmete loend')
+        desired={valid_name(x,'Liige') for x in desired};info=group_members_data(g);current={x['name'] for x in info['current']}
+        added=sorted(desired-current);removed=sorted(current-desired)
+        if added:samba('group','addmembers',g,','.join(added))
+        if removed:samba('group','removemembers',g,','.join(removed))
+        if added or removed:run(['/usr/bin/net','cache','flush'],False)
+        audit(a,g);return {'message':f'Liikmesus uuendatud: +{len(added)}, −{len(removed)}','added':added,'removed':removed}
+    if a=='group_members':
+        require(req,'group','members');g=valid_name(req['group']);members=','.join(valid_name(x.strip(),'Liige') for x in str(req['members']).split(','));verb='addmembers' if req.get('operation')=='Lisa' else 'removemembers';return mutate(a,g,['group',verb,g,members])
+    if a=='computer_create':
+        require(req,'name');n=valid_name(req['name']);args=['computer','create',n]
+        if req.get('description'):args.append(f"--description={str(req['description']).strip()}")
+        return mutate(a,n,args)
+    if a=='computer_delete':
+        n=valid_name(req.get('name'));return mutate(a,n,['computer','delete',n])
+    if a=='computer_move':
+        require(req,'name','ou');n=valid_name(req['name']);ou=str(req['ou']).strip()
+        if not re.fullmatch(r'(?:OU|CN)=[^\r\n]+',ou,re.I):raise ValueError('Vigane siht-OU DN')
+        return mutate(a,n,['computer','move',n,ou])
+    if a=='ou_create':
+        require(req,'name');n=valid_name(req['name']);dn=f'OU={n}'+(f",{str(req['parent']).strip()}" if req.get('parent') else '');return mutate(a,dn,['ou','create',dn])
+    if a=='ou_delete':
+        n=valid_name(req.get('name'));item=next((x for x in ou_items() if x['name']==n),None)
+        if not item:raise ValueError('OU-d ei leitud')
+        return mutate(a,item['dn'],['ou','delete',item['dn']])
+    if a in ('ou_rename','ou_move'):
+        require(req,'name');n=valid_name(req['name']);item=next((x for x in ou_items() if x['name']==n),None)
+        if not item:raise ValueError('OU-d ei leitud')
+        if a=='ou_rename':require(req,'new_name');new=f"OU={valid_name(req['new_name'],'Uus nimi')},"+item['dn'].split(',',1)[1];return mutate(a,item['dn'],['ou','rename',item['dn'],new])
+        require(req,'parent');parent=str(req['parent']).strip()
+        if not re.fullmatch(r'(?:OU|DC)=[^\r\n]+',parent,re.I):raise ValueError('Vigane ülem-OU DN')
+        return mutate(a,item['dn'],['ou','move',item['dn'],parent])
+    if a=='dns_records':
+        z=valid_zone(req.get('zone'));raw=samba('dns','query','127.0.0.1',z,'@','ALL','--authority','-P').stdout;items=[];name='@'
+        for line in raw.splitlines():
+            m=re.search(r'Name=([^,]*),',line)
+            if m:name=m.group(1) or '@';continue
+            m=re.match(r'\s+(A|AAAA|PTR|CNAME|NS|MX|SRV|TXT):\s*(.*?)\s*\(flags=',line)
+            if m:items.append({'name':name,'type':m.group(1),'data':m.group(2).strip('"')})
+        return {'raw':raw,'items':items}
+    if a=='dns_zone_create':z=valid_zone(req.get('zone'));return mutate(a,z,['dns','zonecreate','127.0.0.1',z,'-P'])
+    if a=='dns_zone_delete':z=valid_zone(req.get('zone'));return mutate(a,z,['dns','zonedelete','127.0.0.1',z,'-P'])
+    if a in ('dns_record_add','dns_record_delete'):
+        require(req,'zone','name','type','data');z=valid_zone(req['zone']);n=str(req['name']).strip();typ=str(req['type']).upper();data=str(req['data']).strip()
+        if not DNS_NAME.fullmatch(n) or typ not in ('A','AAAA','PTR','CNAME','NS','MX','SRV','TXT'):raise ValueError('Vigane DNS-kirje')
+        verb='add' if a.endswith('add') else 'delete';return mutate(a,f'{n}.{z}',['dns',verb,'127.0.0.1',z,n,typ,data,'-P'])
+    if a=='dns_record_update':
+        require(req,'zone','name','type','old_data','new_data');z=valid_zone(req['zone']);n=str(req['name']).strip();typ=str(req['type']).upper();old=str(req['old_data']).strip();new=str(req['new_data']).strip()
+        if not DNS_NAME.fullmatch(n) or typ not in ('A','AAAA','PTR','CNAME','NS','MX','SRV','TXT'):raise ValueError('Vigane DNS-kirje')
+        return mutate(a,f'{n}.{z}',['dns','update','127.0.0.1',z,n,typ,old,new,'-P'])
+    if a=='gpo_create':
+        require(req,'display');n=valid_name(req['display'])
+        try:p=samba_auth(req,['gpo','create',n]);audit(a,n);return {'message':p.stdout.strip() or 'GPO loodud.'}
+        except Exception:audit(a,n,False);raise
+    if a=='gpo_delete':
+        n=valid_gpo(req.get('name'))
+        if req.get('confirm')!=n:raise ValueError('Kinnituseks sisestatud GPO nimi ei ühti')
+        try:p=samba_auth(req,['gpo','del',n]);audit(a,n);return {'message':p.stdout.strip() or 'GPO kustutatud.'}
+        except Exception:audit(a,n,False);raise
+    if a=='gpo_backup':
+        n=valid_gpo(req.get('name'));BACKUPS.mkdir(parents=True,exist_ok=True)
+        try:p=samba_auth(req,['gpo','backup',n,f'--tmpdir={BACKUPS}'],cwd=BACKUPS);audit(a,n);return {'message':p.stdout.strip() or 'GPO varundatud.'}
+        except Exception:audit(a,n,False);raise
+    if a=='kcc':return {'output':samba('drs','kcc',domain_info()['dc']).stdout}
+    if a=='replicate':
+        d=domain_info();rep=replication();
+        if not rep['partner']:raise ValueError('Replikatsioonipartnerit ei leitud')
+        dn=','.join(f'DC={x}' for x in d['realm'].split('.'));return {'output':samba('drs','replicate',d['dc'],rep['partner'],dn).stdout}
+    if a=='dbcheck':return {'output':samba('dbcheck','--cross-ncs').stdout}
+    if a=='testparm':return {'output':run(['/usr/bin/testparm','-s'],False).stdout}
+    if a=='logs':return {'output':run(['/usr/bin/journalctl','-u','samba-ad-dc','-n','150','--no-pager'],False).stdout}
+    if a=='backup':
+        BACKUPS.mkdir(parents=True,exist_ok=True)
+        try:p=samba_auth(req,['domain','backup','online',f"--server={domain_info()['dc']}",f'--targetdir={BACKUPS}'],timeout=600);audit(a,str(BACKUPS));return {'message':p.stdout.strip() or 'Varukoopia loodud.'}
+        except Exception:audit(a,str(BACKUPS),False);raise
+    if a=='backup_verify':
+        p=backup_path(req.get('name'));run(['/usr/bin/bzip2','-t',str(p)],timeout=300);sha=run(['/usr/bin/sha256sum',str(p)],timeout=300).stdout.split()[0];audit(a,p.name)
+        return {'message':'Varukoopia arhiiv on terve.','sha256':sha,'bytes':p.stat().st_size,'modified':datetime.datetime.fromtimestamp(p.stat().st_mtime).isoformat()}
+    if a=='backup_delete':
+        p=backup_path(req.get('name'))
+        if req.get('confirm')!=p.name:raise ValueError('Kinnituseks sisestatud failinimi ei ühti')
+        p.unlink();audit(a,p.name);return {'message':'Varukoopia kustutatud.'}
+    if a=='service_restart':
+        run(['/bin/systemctl','restart','samba-ad-dc']);audit(a,'samba-ad-dc');return {'message':'Samba AD DC taaskäivitatud.'}
+    raise ValueError('Tundmatu toiming')
+
+try:print(json.dumps(main(json.loads(sys.stdin.read() or '{}')),ensure_ascii=False))
+except Exception as e:print(json.dumps({'error':str(e)},ensure_ascii=False))

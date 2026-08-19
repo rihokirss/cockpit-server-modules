@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "requires": { "cockpit": "215" },
+  "menu": {
+    "radius": {
+      "label": "RADIUS",
+      "order": 42,
+      "path": "index.html"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tar
+*.tar.gz
+*.pem
+*.key
+*.crt
+.DS_Store
+.idea/
+.vscode/

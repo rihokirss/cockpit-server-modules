@@ -1,0 +1,117 @@
+#!/usr/bin/python3
+import datetime, json, os, re, subprocess, sys, tempfile
+from pathlib import Path
+
+DB = Path('/etc/cockpit-reverseproxy/sites.json')
+CONF = Path('/etc/nginx/conf.d/cockpit-reverseproxy.conf')
+DOMAIN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
+HOST = re.compile(r'^[a-zA-Z0-9_.:-]+$')
+CERT_NAME = re.compile(r'^[A-Za-z0-9_.-]{1,253}$')
+
+def run(args, check=True):
+    p = subprocess.run(args, text=True, capture_output=True)
+    if check and p.returncode:
+        raise RuntimeError((p.stderr or p.stdout).strip() or f'{args[0]} ebaõnnestus')
+    return p
+
+def load():
+    if not DB.exists(): return []
+    data=json.loads(DB.read_text())
+    return data if isinstance(data,list) else []
+
+def validate(s):
+    domain=str(s.get('domain','')).lower().strip()
+    host=str(s.get('host','')).strip()
+    scheme=s.get('scheme','http')
+    try: port=int(s.get('port'))
+    except Exception: raise ValueError('Vigane sihtport')
+    try: https_port=int(s.get('https_port',443))
+    except Exception: raise ValueError('Vigane HTTPS port')
+    if not DOMAIN.fullmatch(domain): raise ValueError('Vigane domeeninimi')
+    if not HOST.fullmatch(host): raise ValueError('Vigane sihtserver')
+    if scheme not in ('http','https'): raise ValueError('Vigane protokoll')
+    if not 1 <= port <= 65535: raise ValueError('Port peab olema 1–65535')
+    if not 1 <= https_port <= 65535 or https_port == 80: raise ValueError('Vigane HTTPS port')
+    certificate=str(s.get('certificate','')).strip()
+    if certificate and (not CERT_NAME.fullmatch(certificate) or not has_cert(certificate)): raise ValueError('Valitud sertifikaati ei leitud')
+    return {'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True))}
+
+def has_cert(name):
+    return bool(name and CERT_NAME.fullmatch(name) and Path('/etc/letsencrypt/live',name,'fullchain.pem').exists())
+
+def cert_expiry(name):
+    if not has_cert(name): return ''
+    p=run(['/usr/bin/openssl','x509','-enddate','-noout','-in',f'/etc/letsencrypt/live/{name}/fullchain.pem'],False)
+    return p.stdout.strip().removeprefix('notAfter=')
+
+def certificates():
+    live=Path('/etc/letsencrypt/live')
+    if not live.exists(): return []
+    return [{'name':p.name,'expiry':cert_expiry(p.name)} for p in sorted(live.iterdir()) if p.name!='README' and has_cert(p.name)]
+
+def generate(sites):
+    out=['# Managed by Cockpit Reverse Proxy. Do not edit manually.','map $http_upgrade $connection_upgrade {','    default upgrade;','    \'\' close;','}','']
+    for s in sites:
+        if not s['enabled']: continue
+        d=s['domain']; target=f"{s['scheme']}://{s['host']}:{s['port']}"; tls_port=int(s.get('https_port',443)); cert_name=s.get('certificate') or (d if has_cert(d) else '')
+        out += ['server {','    listen 80;','    listen [::]:80;',f'    server_name {d};','    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }']
+        if has_cert(cert_name):
+            redirect='https://$host$request_uri' if tls_port==443 else f'https://$host:{tls_port}$request_uri'
+            out += [f'    location / {{ return 301 {redirect}; }}','}','', 'server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {d};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;']
+        out += ['    client_max_body_size 0;','    location / {',f'        proxy_pass {target};','        proxy_http_version 1.1;','        proxy_set_header Host $host;','        proxy_set_header X-Real-IP $remote_addr;','        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;','        proxy_set_header X-Forwarded-Proto $scheme;','        proxy_read_timeout 3600s;','        proxy_send_timeout 3600s;','        proxy_buffering off;']
+        if s['websocket']:
+            out += ['        proxy_set_header Upgrade $http_upgrade;','        proxy_set_header Connection $connection_upgrade;']
+        out += ['    }','}','']
+    return '\n'.join(out)
+
+def persist(sites):
+    DB.parent.mkdir(mode=0o750,parents=True,exist_ok=True)
+    conf=generate(sites)
+    old=CONF.read_text() if CONF.exists() else None
+    with tempfile.NamedTemporaryFile('w',dir=CONF.parent,delete=False) as f: f.write(conf); tmp=f.name
+    os.chmod(tmp,0o644); os.replace(tmp,CONF)
+    p=run(['/usr/sbin/nginx','-t'],False)
+    if p.returncode:
+        if old is None: CONF.unlink(missing_ok=True)
+        else: CONF.write_text(old)
+        raise RuntimeError((p.stderr or p.stdout).strip())
+    with tempfile.NamedTemporaryFile('w',dir=DB.parent,delete=False) as f: json.dump(sites,f,indent=2); f.write('\n'); tmp=f.name
+    os.chmod(tmp,0o640); os.replace(tmp,DB)
+    run(['/bin/systemctl','reload','nginx'])
+
+def main(req):
+    action=req.get('action'); sites=load()
+    if action=='list':
+        enriched=[]
+        for s in sites:
+            cert_name=s.get('certificate') or (s['domain'] if has_cert(s['domain']) else '')
+            enriched.append(dict(s,certificate=cert_name,https=has_cert(cert_name),cert_expiry=cert_expiry(cert_name)))
+        return {'sites':enriched,'certificates':certificates(),'active':run(['/bin/systemctl','is-active','nginx'],False).returncode==0}
+    if action=='save':
+        s=validate(req.get('site',{})); original=req.get('original_domain','')
+        if original and original!=s['domain']: sites=[x for x in sites if x['domain']!=original]
+        if any(x['domain']==s['domain'] for x in sites): sites=[s if x['domain']==s['domain'] else x for x in sites]
+        else: sites.append(s)
+        persist(sites); return {'ok':True}
+    if action=='delete':
+        domain=req.get('domain',''); persist([s for s in sites if s['domain']!=domain]); return {'ok':True}
+    if action=='test':
+        p=run(['/usr/sbin/nginx','-t']); return {'message':(p.stderr or p.stdout).strip()}
+    if action=='reload': run(['/usr/sbin/nginx','-t']); run(['/bin/systemctl','reload','nginx']); return {'ok':True}
+    if action=='sync': persist(sites); return {'ok':True}
+    if action=='logs':
+        p=run(['/usr/bin/journalctl','-u','nginx','-n','80','--no-pager'],False); return {'logs':p.stdout[-16000:]}
+    if action=='health':
+        domain=req.get('domain',''); s=next((x for x in sites if x['domain']==domain),None)
+        if not s: raise ValueError('Tundmatu domeen')
+        url=f"{s['scheme']}://{s['host']}:{s['port']}/"
+        p=run(['/usr/bin/curl','-k','-sS','-o','/dev/null','--connect-timeout','4','--max-time','8','-w','%{http_code} %{time_total}',url],False)
+        if p.returncode: raise RuntimeError(p.stderr.strip() or 'Sihtteenus ei vasta')
+        code,seconds=p.stdout.split(); return {'code':code,'time_ms':round(float(seconds)*1000)}
+    raise ValueError('Tundmatu toiming')
+
+try:
+    req=json.loads(sys.stdin.read() or '{}')
+    print(json.dumps(main(req),ensure_ascii=False))
+except Exception as e:
+    print(json.dumps({'error':str(e)},ensure_ascii=False))

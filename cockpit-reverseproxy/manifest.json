@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "requires": { "cockpit": "300" },
+  "menu": {
+    "index": {
+      "label": "Reverse Proxy",
+      "order": 75,
+      "keywords": [ { "matches": [ "nginx", "proxy", "websocket" ] } ]
+    }
+  }
+}

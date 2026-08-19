@@ -1,0 +1,583 @@
+#!/usr/bin/python3
+"""Privileged backend for the Cockpit Certificates module."""
+
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+CONFIG = Path('/etc/cockpit-certificates/config.json')
+LOG = Path('/var/log/cockpit-certificates.log')
+LIVE = Path('/etc/letsencrypt/live')
+ACME_CONF = Path('/etc/nginx/conf.d/cockpit-certificates-acme.conf')
+WEBROOT = Path('/var/www/certbot')
+PROXY_DB = Path('/etc/cockpit-reverseproxy/sites.json')
+DOMAIN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
+CERT_NAME = re.compile(r'^[A-Za-z0-9_.-]{1,253}$')
+HOST = re.compile(r'^[A-Za-z0-9_.:-]{1,253}$')
+
+
+def run(args, check=True):
+    result = subprocess.run(args, text=True, capture_output=True)
+    if check and result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip() or f'{args[0]} ebaõnnestus')
+    return result
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def log(message):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open('a') as stream:
+        stream.write(f'{now_iso()} {message}\n')
+    os.chmod(LOG, 0o600)
+
+
+def default_config():
+    return {
+        'certificates': {},
+        'synology': {
+            'host': '',
+            'port': 5001,
+            'https': True,
+            'verify_tls': False,
+            'username': '',
+            'password': '',
+        },
+    }
+
+
+def load_config():
+    data = default_config()
+    if CONFIG.exists():
+        saved = json.loads(CONFIG.read_text())
+        if isinstance(saved, dict):
+            data['certificates'] = saved.get('certificates', {}) if isinstance(saved.get('certificates', {}), dict) else {}
+            if isinstance(saved.get('synology'), dict):
+                data['synology'].update(saved['synology'])
+    return data
+
+
+def save_config(data):
+    CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile('w', dir=CONFIG.parent, delete=False) as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
+        stream.write('\n')
+        temporary = stream.name
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, CONFIG)
+
+
+def proxy_sites():
+    try:
+        data = json.loads(PROXY_DB.read_text())
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def certificate_path(name):
+    return LIVE / name
+
+
+def certificate_exists(name):
+    return CERT_NAME.fullmatch(name or '') is not None and (certificate_path(name) / 'fullchain.pem').exists()
+
+
+def cert_details(name):
+    path = certificate_path(name) / 'fullchain.pem'
+    if not path.exists():
+        return None
+    result = run(['/usr/bin/openssl', 'x509', '-in', str(path), '-noout', '-startdate', '-enddate', '-issuer', '-subject', '-ext', 'subjectAltName'], False)
+    if result.returncode:
+        return None
+    values = {}
+    for line in result.stdout.splitlines():
+        if '=' in line and line.split('=', 1)[0] in ('notBefore', 'notAfter', 'issuer', 'subject'):
+            key, value = line.split('=', 1)
+            values[key] = value.strip()
+    domains = re.findall(r'DNS:([^,\s]+)', result.stdout)
+    expiry_epoch = ssl.cert_time_to_seconds(values.get('notAfter', '')) if values.get('notAfter') else 0
+    days = int((expiry_epoch - datetime.now(timezone.utc).timestamp()) // 86400) if expiry_epoch else None
+    return {
+        'name': name,
+        'domains': domains,
+        'not_before': values.get('notBefore', ''),
+        'not_after': values.get('notAfter', ''),
+        'expiry_iso': datetime.fromtimestamp(expiry_epoch, timezone.utc).isoformat() if expiry_epoch else '',
+        'days_left': days,
+        'issuer': values.get('issuer', ''),
+        'subject': values.get('subject', ''),
+    }
+
+
+def all_certificates(config=None):
+    config = config or load_config()
+    names = set(config['certificates'])
+    if LIVE.exists():
+        names.update(path.name for path in LIVE.iterdir() if path.name != 'README' and path.is_dir())
+    sites = proxy_sites()
+    result = []
+    for name in sorted(names):
+        details = cert_details(name)
+        if not details:
+            continue
+        managed = config['certificates'].get(name, {})
+        deployment = managed.get('synology', {}) if isinstance(managed, dict) else {}
+        in_use = []
+        for site in sites:
+            selected = site.get('certificate') or (site.get('domain') if certificate_exists(site.get('domain', '')) else '')
+            if selected == name:
+                in_use.append(site.get('domain', ''))
+        details.update({
+            'managed': name in config['certificates'],
+            'in_use_by': in_use,
+            'synology': {
+                'enabled': bool(deployment.get('enabled')),
+                'description': deployment.get('description', name),
+                'make_default': bool(deployment.get('make_default')),
+                'last_status': deployment.get('last_status', ''),
+                'last_message': deployment.get('last_message', ''),
+                'last_deployed': deployment.get('last_deployed', ''),
+            },
+        })
+        result.append(details)
+    return result
+
+
+def validate_domains(domains):
+    clean = []
+    for value in domains if isinstance(domains, list) else []:
+        domain = str(value).strip().lower()
+        if not DOMAIN.fullmatch(domain):
+            raise ValueError(f'Vigane domeeninimi: {domain or "(tühi)"}')
+        if domain not in clean:
+            clean.append(domain)
+    if not clean:
+        raise ValueError('Lisa vähemalt üks domeeninimi')
+    return clean
+
+
+def managed_domains(config):
+    names = set()
+    for item in config['certificates'].values():
+        if isinstance(item, dict):
+            names.update(validate_domains(item.get('domains', [])) if item.get('domains') else [])
+    return names
+
+
+def write_acme_config(config):
+    proxy_domains = {str(site.get('domain', '')).lower() for site in proxy_sites() if site.get('enabled', True)}
+    domains = sorted(managed_domains(config) - proxy_domains)
+    lines = ['# Managed by Cockpit Certificates. Do not edit manually.']
+    if domains:
+        lines += [
+            'server {',
+            '    listen 80;',
+            '    listen [::]:80;',
+            f'    server_name {" ".join(domains)};',
+            '    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }',
+            '    location / { return 404; }',
+            '}',
+        ]
+    ACME_CONF.parent.mkdir(parents=True, exist_ok=True)
+    old = ACME_CONF.read_text() if ACME_CONF.exists() else None
+    with tempfile.NamedTemporaryFile('w', dir=ACME_CONF.parent, delete=False) as stream:
+        stream.write('\n'.join(lines) + '\n')
+        temporary = stream.name
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, ACME_CONF)
+    result = run(['/usr/sbin/nginx', '-t'], False)
+    if result.returncode:
+        if old is None:
+            ACME_CONF.unlink(missing_ok=True)
+        else:
+            ACME_CONF.write_text(old)
+        raise RuntimeError((result.stderr or result.stdout).strip())
+    run(['/bin/systemctl', 'reload', 'nginx'])
+
+
+def sync_reverse_proxy():
+    helper = Path('/usr/local/libexec/cockpit-reverseproxy-helper')
+    if not helper.exists():
+        return
+    result = subprocess.run([str(helper)], input='{"action":"sync"}', text=True, capture_output=True)
+    try:
+        response = json.loads(result.stdout or '{}')
+    except json.JSONDecodeError:
+        response = {}
+    if result.returncode or response.get('error'):
+        raise RuntimeError(response.get('error') or result.stderr.strip() or 'Reverse Proxy sünkroonimine ebaõnnestus')
+
+
+def timer_info():
+    enabled = run(['/bin/systemctl', 'is-enabled', 'certbot.timer'], False).returncode == 0
+    active = run(['/bin/systemctl', 'is-active', 'certbot.timer'], False).returncode == 0
+    next_run = run(['/bin/systemctl', 'show', 'certbot.timer', '--property=NextElapseUSecRealtime', '--value'], False).stdout.strip()
+    if next_run:
+        converted = run(['/usr/bin/date', '-d', next_run, '--iso-8601=seconds'], False)
+        next_run = converted.stdout.strip() if converted.returncode == 0 else next_run
+    return {'enabled': enabled, 'active': active, 'next_run': next_run}
+
+
+DSM_ERRORS = {
+    105: 'DSM-i kasutajal puuduvad administraatori õigused',
+    119: 'DSM ei leidnud autentimisseanssi',
+    400: 'Vale kasutajanimi või parool',
+    401: 'DSM-i kasutajakontot ei leitud',
+    403: 'Kontol on kaheastmeline autentimine; kasuta automaatseks edastuseks eraldi 2FA-ta administraatorikontot',
+    406: 'DSM nõuab sellelt kontolt kaheastmelist autentimist',
+    408: 'DSM-i konto parool on aegunud',
+    409: 'DSM-i konto parool tuleb muuta',
+    410: 'DSM-i konto parool on aegunud',
+}
+
+
+class Synology:
+    def __init__(self, settings):
+        self.settings = validate_synology(settings, require_password=True)
+        scheme = 'https' if self.settings['https'] else 'http'
+        host = self.settings['host']
+        if ':' in host and not host.startswith('['):
+            host = f'[{host}]'
+        self.base = f'{scheme}://{host}:{self.settings["port"]}'
+        self.context = None
+        if scheme == 'https' and not self.settings['verify_tls']:
+            self.context = ssl._create_unverified_context()
+        self.sid = ''
+        self.token = ''
+        self.auth_path = 'auth.cgi'
+        self.auth_version = 6
+        self.session = 'CockpitCertificates'
+
+    def request(self, path, params=None, data=None, headers=None, timeout=15):
+        query = urllib.parse.urlencode(params or {})
+        url = f'{self.base}/webapi/{path}' + (f'?{query}' if query else '')
+        body = urllib.parse.urlencode(data).encode() if isinstance(data, dict) else data
+        request = urllib.request.Request(url, data=body, headers=headers or {})
+        try:
+            with urllib.request.urlopen(request, context=self.context, timeout=timeout) as response:
+                payload = response.read()
+        except urllib.error.HTTPError as error:
+            payload = error.read()
+        except (urllib.error.URLError, TimeoutError) as error:
+            reason = getattr(error, 'reason', error)
+            raise RuntimeError(f'DSM-i ühendus ebaõnnestus: {reason}') from None
+        try:
+            result = json.loads(payload.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise RuntimeError('DSM tagastas ootamatu vastuse') from None
+        if not result.get('success'):
+            code = int(result.get('error', {}).get('code', 0) or 0)
+            raise RuntimeError(DSM_ERRORS.get(code, f'DSM API viga {code or "(tundmatu)"}'))
+        return result.get('data', {})
+
+    def login(self):
+        info = self.request('query.cgi', params={
+            'api': 'SYNO.API.Info', 'version': 1, 'method': 'query', 'query': 'SYNO.API.Auth'
+        })
+        auth = info.get('SYNO.API.Auth', {})
+        self.auth_path = auth.get('path', 'auth.cgi')
+        self.auth_version = min(int(auth.get('maxVersion', 6)), 7)
+        data = self.request(self.auth_path, data={
+            'api': 'SYNO.API.Auth', 'version': self.auth_version, 'method': 'login',
+            'format': 'sid', 'account': self.settings['username'], 'passwd': self.settings['password'],
+            'session': self.session, 'enable_syno_token': 'yes',
+        })
+        self.sid = data.get('sid', '')
+        self.token = data.get('synotoken', '')
+        if not self.sid or not self.token:
+            raise RuntimeError('DSM ei tagastanud turvalist seanssi')
+        return self
+
+    def logout(self):
+        if not self.sid:
+            return
+        try:
+            self.request(self.auth_path, params={
+                'api': 'SYNO.API.Auth', 'version': self.auth_version, 'method': 'logout',
+                'session': self.session, '_sid': self.sid
+            })
+        except Exception:
+            pass
+
+    def certificates(self):
+        return self.request('entry.cgi', params={
+            'api': 'SYNO.Core.Certificate.CRT', 'version': 1, 'method': 'list',
+            '_sid': self.sid, 'SynoToken': self.token,
+        }, headers={'X-SYNO-TOKEN': self.token})
+
+    def upload(self, name, description, make_default=False):
+        listing = self.certificates()
+        certificates = listing.get('certificates', listing) if isinstance(listing, dict) else listing
+        certificates = certificates if isinstance(certificates, list) else []
+        existing = next((item for item in certificates if item.get('desc') == description), None)
+        # DSM service bindings point to a certificate ID, not its common name.
+        # When a user has not copied DSM's old description exactly, reuse the
+        # single matching CN instead of creating an unbound duplicate.
+        if not existing:
+            domains = cert_details(name).get('domains', [])
+            same_cn = [item for item in certificates if item.get('subject', {}).get('common_name') in domains]
+            if len(same_cn) == 1:
+                existing = same_cn[0]
+            elif same_cn:
+                bound = [item for item in same_cn if item.get('is_default') or item.get('services')]
+                if len(bound) == 1:
+                    existing = bound[0]
+        fields = {'id': existing.get('id', '') if existing else '', 'desc': description}
+        if make_default or (existing and existing.get('is_default')):
+            fields['as_default'] = 'true'
+        lineage = certificate_path(name)
+        files = {
+            'key': ('privkey.pem', (lineage / 'privkey.pem').read_bytes()),
+            'cert': ('cert.pem', (lineage / 'cert.pem').read_bytes()),
+            'inter_cert': ('chain.pem', (lineage / 'chain.pem').read_bytes()),
+        }
+        body, content_type = multipart(fields, files)
+        return self.request('entry.cgi', params={
+            'api': 'SYNO.Core.Certificate', 'version': 1, 'method': 'import',
+            'SynoToken': self.token, '_sid': self.sid,
+        }, data=body, headers={'Content-Type': content_type, 'X-SYNO-TOKEN': self.token}, timeout=45)
+
+
+def multipart(fields, files):
+    boundary = f'------------------------{uuid.uuid4().hex}'
+    chunks = []
+    for key, value in fields.items():
+        chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    for key, (filename, content) in files.items():
+        chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode())
+        chunks.append(content)
+        chunks.append(b'\r\n')
+    chunks.append(f'--{boundary}--\r\n'.encode())
+    return b''.join(chunks), f'multipart/form-data; boundary={boundary}'
+
+
+def validate_synology(settings, require_password=False):
+    host = str(settings.get('host', '')).strip()
+    if not HOST.fullmatch(host):
+        raise ValueError('Vigane Synology aadress')
+    try:
+        port = int(settings.get('port', 5001))
+    except (TypeError, ValueError):
+        raise ValueError('Vigane DSM-i port') from None
+    if not 1 <= port <= 65535:
+        raise ValueError('DSM-i port peab olema 1–65535')
+    username = str(settings.get('username', '')).strip()
+    password = str(settings.get('password', ''))
+    if require_password and (not username or not password):
+        raise ValueError('Sisesta Synology kasutajanimi ja parool')
+    return {
+        'host': host, 'port': port, 'https': settings.get('https') is True,
+        'verify_tls': settings.get('verify_tls') is True, 'username': username, 'password': password,
+    }
+
+
+def synology_settings_public(settings):
+    return {
+        'host': settings.get('host', ''), 'port': settings.get('port', 5001),
+        'https': settings.get('https', True), 'verify_tls': settings.get('verify_tls', False),
+        'username': settings.get('username', ''), 'password_set': bool(settings.get('password')),
+    }
+
+
+def merged_synology(config, supplied=None):
+    settings = dict(config['synology'])
+    if isinstance(supplied, dict):
+        password = str(supplied.get('password', ''))
+        settings.update({key: supplied[key] for key in ('host', 'port', 'https', 'verify_tls', 'username') if key in supplied})
+        if password:
+            settings['password'] = password
+    return settings
+
+
+def deploy_synology(name, config, raise_error=True):
+    item = config['certificates'].setdefault(name, {})
+    deployment = item.setdefault('synology', {})
+    description = str(deployment.get('description') or name).strip()
+    try:
+        client = Synology(config['synology']).login()
+        try:
+            client.upload(name, description, bool(deployment.get('make_default')))
+        finally:
+            client.logout()
+        deployment.update({'last_status': 'success', 'last_message': 'Sertifikaat edastati DSM-i', 'last_deployed': now_iso()})
+        save_config(config)
+        log(f'{name}: Synology edastus õnnestus ({config["synology"]["host"]}, {description})')
+        return {'ok': True, 'message': 'Sertifikaat edastati Synology DSM-i.'}
+    except Exception as error:
+        deployment.update({'last_status': 'error', 'last_message': str(error), 'last_deployed': now_iso()})
+        save_config(config)
+        log(f'{name}: Synology edastus ebaõnnestus: {error}')
+        if raise_error:
+            raise
+        return {'ok': False, 'message': str(error)}
+
+
+def renewal_hook():
+    config = load_config()
+    lineage = os.environ.get('RENEWED_LINEAGE', '')
+    name = Path(lineage).name if lineage else ''
+    failures = []
+    result = run(['/usr/sbin/nginx', '-t'], False)
+    if result.returncode == 0:
+        run(['/bin/systemctl', 'reload', 'nginx'], False)
+        log(f'{name or "sertifikaadid"}: nginx laaditi pärast uuendust uuesti')
+    else:
+        failures.append((result.stderr or result.stdout).strip())
+    if name and config['certificates'].get(name, {}).get('synology', {}).get('enabled'):
+        deployed = deploy_synology(name, config, raise_error=False)
+        if not deployed['ok']:
+            failures.append(deployed['message'])
+    if failures:
+        raise RuntimeError('; '.join(failures))
+
+
+def main(request):
+    action = request.get('action')
+    config = load_config()
+    if action == 'list':
+        return {
+            'certificates': all_certificates(config), 'timer': timer_info(),
+            'synology': synology_settings_public(config['synology']),
+            'nginx_active': run(['/bin/systemctl', 'is-active', 'nginx'], False).returncode == 0,
+        }
+    if action == 'timer_set':
+        enabled = request.get('enabled') is True
+        run(['/bin/systemctl', 'enable', '--now', 'certbot.timer'] if enabled else ['/bin/systemctl', 'disable', '--now', 'certbot.timer'])
+        log(f'Certboti automaatuuendus {"lubatud" if enabled else "peatatud"}')
+        return timer_info()
+    if action == 'issue':
+        domains = validate_domains(request.get('domains', []))
+        name = str(request.get('name') or domains[0]).strip()
+        if not CERT_NAME.fullmatch(name):
+            raise ValueError('Vigane sertifikaadi nimi')
+        previous = config['certificates'].get(name)
+        item = dict(previous) if isinstance(previous, dict) else {}
+        item['domains'] = domains
+        config['certificates'][name] = item
+        WEBROOT.mkdir(mode=0o755, parents=True, exist_ok=True)
+        save_config(config)
+        try:
+            write_acme_config(config)
+            command = ['/usr/bin/certbot', 'certonly', '--webroot', '-w', str(WEBROOT), '--cert-name', name,
+                       '--key-type', 'rsa', '--rsa-key-size', '2048', '--non-interactive', '--agree-tos',
+                       '--register-unsafely-without-email']
+            for domain in domains:
+                command += ['-d', domain]
+            if certificate_exists(name):
+                command += ['--force-renewal']
+            result = run(command)
+            sync_reverse_proxy()
+            if item.get('synology', {}).get('enabled'):
+                deploy_synology(name, config)
+            log(f'{name}: sertifikaat väljastati domeenidele {", ".join(domains)}')
+            return {'ok': True, 'message': (result.stdout or result.stderr).strip()[-4000:]}
+        except Exception:
+            if previous is None:
+                config['certificates'].pop(name, None)
+            else:
+                config['certificates'][name] = previous
+            save_config(config)
+            write_acme_config(config)
+            raise
+    if action == 'renew':
+        name = str(request.get('name', ''))
+        if not certificate_exists(name):
+            raise ValueError('Sertifikaati ei leitud')
+        result = run(['/usr/bin/certbot', 'renew', '--cert-name', name, '--force-renewal', '--no-random-sleep-on-renew'])
+        log(f'{name}: käsitsi uuendamine lõpetatud')
+        return {'ok': True, 'message': (result.stdout or result.stderr).strip()[-4000:]}
+    if action == 'renew_all':
+        result = run(['/usr/bin/certbot', 'renew', '--no-random-sleep-on-renew'])
+        log('Kõigi sertifikaatide uuenduskontroll lõpetatud')
+        return {'ok': True, 'message': (result.stdout or result.stderr).strip()[-4000:]}
+    if action == 'delete':
+        name = str(request.get('name', ''))
+        details = next((item for item in all_certificates(config) if item['name'] == name), None)
+        if not details:
+            raise ValueError('Sertifikaati ei leitud')
+        if details['in_use_by']:
+            raise ValueError('Sertifikaat on Reverse Proxy kasutuses: ' + ', '.join(details['in_use_by']))
+        run(['/usr/bin/certbot', 'delete', '--cert-name', name, '--non-interactive'])
+        config['certificates'].pop(name, None)
+        save_config(config)
+        write_acme_config(config)
+        log(f'{name}: sertifikaat kustutati')
+        return {'ok': True}
+    if action == 'synology_save':
+        settings = merged_synology(config, request.get('settings'))
+        config['synology'] = validate_synology(settings, require_password=False)
+        save_config(config)
+        log(f'Synology seadistus salvestati ({config["synology"]["host"]})')
+        return {'synology': synology_settings_public(config['synology'])}
+    if action == 'synology_test':
+        settings = merged_synology(config, request.get('settings'))
+        client = Synology(settings).login()
+        try:
+            listing = client.certificates()
+        finally:
+            client.logout()
+        certificates = listing.get('certificates', listing) if isinstance(listing, dict) else listing
+        count = len(certificates) if isinstance(certificates, list) else 0
+        log(f'Synology ühenduse test õnnestus ({settings["host"]})')
+        return {'ok': True, 'count': count, 'message': f'Ühendus toimib. DSM-is on {count} sertifikaati.'}
+    if action == 'deployment_save':
+        name = str(request.get('name', ''))
+        if not certificate_exists(name):
+            raise ValueError('Sertifikaati ei leitud')
+        supplied = request.get('deployment', {})
+        description = str(supplied.get('description') or name).strip()
+        if not description or len(description) > 128 or '\\' in description:
+            raise ValueError('Vigane DSM-i sertifikaadi kirjeldus')
+        item = config['certificates'].setdefault(name, {'domains': cert_details(name)['domains']})
+        previous = item.get('synology', {})
+        item['synology'] = {
+            'enabled': supplied.get('enabled') is True, 'description': description,
+            'make_default': supplied.get('make_default') is True,
+            'last_status': previous.get('last_status', ''), 'last_message': previous.get('last_message', ''),
+            'last_deployed': previous.get('last_deployed', ''),
+        }
+        save_config(config)
+        return {'ok': True}
+    if action == 'deploy':
+        name = str(request.get('name', ''))
+        if not certificate_exists(name):
+            raise ValueError('Sertifikaati ei leitud')
+        if name not in config['certificates']:
+            config['certificates'][name] = {'domains': cert_details(name)['domains'], 'synology': {'description': name}}
+            save_config(config)
+        return deploy_synology(name, config)
+    if action == 'logs':
+        own = LOG.read_text()[-12000:] if LOG.exists() else ''
+        journal = run(['/usr/bin/journalctl', '-u', 'certbot.service', '-n', '60', '--no-pager'], False).stdout[-12000:]
+        return {'logs': (own + ('\n\nCertbot\n' if own else 'Certbot\n') + journal).strip()}
+    raise ValueError('Tundmatu toiming')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == '--renew-hook':
+        try:
+            renewal_hook()
+        except Exception as error:
+            log(f'Uuendusjärgne tegevus ebaõnnestus: {error}')
+            print(str(error), file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+    try:
+        request = json.loads(sys.stdin.read() or '{}')
+        print(json.dumps(main(request), ensure_ascii=False))
+    except Exception as error:
+        print(json.dumps({'error': str(error)}, ensure_ascii=False))

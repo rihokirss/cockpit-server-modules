@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="et"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Samba AD DC</title><link rel="stylesheet" href="../base1/patternfly.css"><link rel="stylesheet" href="style.css"><script src="../base1/cockpit.js"></script></head>
+<body><div id="toast" class="toast hidden"></div>
+<header><div><span class="eyebrow">IDENTITEET JA VÕRK</span><h1>Samba Active Directory</h1><p id="subtitle">Domeeni laadimine…</p></div><div class="header-actions"><span id="health" class="status loading">Kontrollin</span><button class="btn" id="refresh">↻ Värskenda</button></div></header>
+<nav id="nav">
+ <button data-view="overview" class="active">Ülevaade</button><button data-view="users">Kasutajad</button><button data-view="groups">Grupid</button><button data-view="computers">Arvutid</button><button data-view="ous">OU-d</button><button data-view="dns">DNS</button><button data-view="gpo">GPO</button><button data-view="replication">Replikatsioon</button><button data-view="operations">Hooldus</button>
+</nav>
+<main><div id="loading" class="loading-panel"><div class="spinner"></div><span>Laen domeeni andmeid…</span></div><section id="content"></section></main>
+<dialog id="form-dialog"><form id="dynamic-form"><div class="dialog-head"><div><span id="dialog-kicker" class="eyebrow"></span><h2 id="dialog-title"></h2></div><button type="button" class="icon-btn" data-close>×</button></div><div id="form-fields"></div><div class="dialog-actions"><button type="button" class="btn" data-close>Loobu</button><button id="form-submit" class="btn primary">Salvesta</button></div></form></dialog>
+<dialog id="detail-dialog"><div class="dialog-head"><div><span class="eyebrow">DETAILID</span><h2 id="detail-title"></h2></div><button type="button" class="icon-btn" data-close-detail>×</button></div><div id="detail-content"></div><div class="dialog-actions"><button class="btn" data-close-detail>Sulge</button></div></dialog>
+<dialog id="confirm-dialog"><form id="confirm-form"><div class="danger-icon">!</div><h2 id="confirm-title">Kinnita toiming</h2><p id="confirm-text"></p><label id="confirm-label">Sisesta kinnituseks nimi<input id="confirm-input" autocomplete="off"></label><div class="dialog-actions"><button type="button" class="btn" data-close-confirm>Loobu</button><button class="btn danger" id="confirm-submit">Kinnita</button></div></form></dialog>
+<script src="app.js"></script></body></html>

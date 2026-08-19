@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "requires": { "cockpit": "300" },
+  "menu": {
+    "index": {
+      "label": "Samba AD DC",
+      "order": 70,
+      "keywords": [{"matches":["active directory","domain","dns","gpo","samba"]}]
+    }
+  }
+}
