@@ -18,6 +18,11 @@
       <div class="table-wrap"><table><thead><tr><th>Domeen</th><th>Siht</th><th>HTTPS</th><th>WebSocket</th><th></th></tr></thead><tbody id="sites"></tbody></table></div>
       <div id="empty" class="empty hidden">Ühtegi teenust pole seadistatud.</div>
     </section>
+    <section class="card">
+      <div class="section-head"><div><h2>Ühisdomeeni alamrajad</h2><p class="muted">Mitu rakendust ühe domeeni all, näiteks /ilm/ ja /admin/</p></div><button id="route-add" class="btn primary">Lisa alamrada</button></div>
+      <div class="table-wrap"><table><thead><tr><th>Avalik aadress</th><th>Siht</th><th>Prefiks</th><th>WebSocket</th><th></th></tr></thead><tbody id="routes"></tbody></table></div>
+      <div id="routes-empty" class="empty hidden">Ühtegi alamraja marsruuti pole seadistatud.</div>
+    </section>
     <section class="card actions">
       <div><h2>Nginx</h2><p class="muted">Konfiguratsiooni kontroll ja teenuse juhtimine</p></div>
       <button id="test" class="btn">Kontrolli</button><button id="reload" class="btn">Laadi uuesti</button>
@@ -29,7 +34,7 @@
   </main>
   <dialog id="editor">
     <form id="site-form">
-      <h2 id="form-title">Lisa teenus</h2><input type="hidden" id="original-domain">
+      <h2 id="form-title">Lisa teenus</h2><input type="hidden" id="site-id">
       <label>Domeeninimi<input id="domain" required placeholder="home.example.ee" pattern="[A-Za-z0-9.-]+"></label>
       <div class="grid4">
         <label>Sihtprotokoll<select id="scheme"><option>http</option><option>https</option></select></label>
@@ -42,6 +47,28 @@
       <label class="check"><input id="websocket" type="checkbox" checked> WebSocketi tugi</label>
       <label class="check"><input id="enabled" type="checkbox" checked> Teenus on aktiivne</label>
       <div class="dialog-actions"><button type="button" id="cancel" class="btn">Loobu</button><button class="btn primary">Salvesta ja rakenda</button></div>
+    </form>
+  </dialog>
+  <dialog id="route-editor">
+    <form id="route-form">
+      <h2 id="route-title">Lisa alamrada</h2><input type="hidden" id="route-original-id"><input type="hidden" id="route-id">
+      <div class="grid-path">
+        <label>Domeeninimi<input id="route-domain" required placeholder="server.example.ee" pattern="[A-Za-z0-9.-]+"></label>
+        <label>Alamrada<input id="route-path" required placeholder="/rakendus" pattern="/[a-z0-9][a-z0-9_-]*"></label>
+      </div>
+      <div class="grid4">
+        <label>Sihtprotokoll<select id="route-scheme"><option>http</option><option>https</option></select></label>
+        <label>Sihtserver<input id="route-host" required value="127.0.0.1"></label>
+        <label>Sihtport<input id="route-port" type="number" min="1" max="65535" required></label>
+        <label>HTTPS port<input id="route-https-port" type="number" min="1" max="65535" required value="443"></label>
+      </div>
+      <label>TLS-sertifikaat<select id="route-certificate"><option value="">Automaatne või HTTP</option></select></label>
+      <label>Kirjeldus<input id="route-description" maxlength="160" placeholder="Rakenduse nimi või otstarve"></label>
+      <label class="check"><input id="route-strip" type="checkbox" checked> Eemalda alamraja prefiks enne rakendusele edastamist</label>
+      <p class="muted form-hint">Näiteks /ilm/api suunatakse prefiksi eemaldamisel rakendusele aadressina /api. Saadetakse ka X-Forwarded-Prefix päis.</p>
+      <label class="check"><input id="route-websocket" type="checkbox" checked> WebSocketi tugi</label>
+      <label class="check"><input id="route-enabled" type="checkbox" checked> Marsruut on aktiivne</label>
+      <div class="dialog-actions"><button type="button" id="route-cancel" class="btn">Loobu</button><button class="btn primary">Salvesta ja rakenda</button></div>
     </form>
   </dialog>
   <script src="app.js"></script>

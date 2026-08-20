@@ -4,3 +4,4 @@
 :root{color-scheme:light dark}.info-text{margin:14px 0 0;max-width:760px;line-height:1.5}
 :root{color-scheme:light dark}.toggle-row{display:flex;flex-direction:row;align-items:center;justify-content:space-between;margin-top:16px;padding:14px 0 0;border-top:1px solid #ddd}.toggle-row span{display:flex;flex-direction:column;gap:3px}.toggle-row small{color:#6a6e73;font-weight:400}.toggle-row input{width:42px;height:22px;accent-color:#06c;cursor:pointer}
 .header-actions{display:flex;align-items:center;gap:10px}.cert-name{display:block;color:#6a6e73;margin-top:5px}.form-hint{font-size:12px}
+.grid-path{display:grid;grid-template-columns:2fr 1fr;gap:12px}.route-url{display:block;margin-top:4px;color:#6a6e73;font-size:12px}@media(max-width:650px){.grid-path{grid-template-columns:1fr}}

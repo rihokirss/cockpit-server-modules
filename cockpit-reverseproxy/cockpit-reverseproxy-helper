@@ -1,12 +1,16 @@
 #!/usr/bin/python3
-import datetime, json, os, re, subprocess, sys, tempfile
+import datetime, json, os, re, subprocess, sys, tempfile, uuid
 from pathlib import Path
 
 DB = Path('/etc/cockpit-reverseproxy/sites.json')
+ROUTES_DB = Path('/etc/cockpit-reverseproxy/routes.json')
+ROUTE_HOSTS_DB = Path('/etc/cockpit-reverseproxy/route-hosts.json')
 CONF = Path('/etc/nginx/conf.d/cockpit-reverseproxy.conf')
+CERTIFICATES_HELPER = Path('/usr/local/libexec/cockpit-certificates-helper')
 DOMAIN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
 HOST = re.compile(r'^[a-zA-Z0-9_.:-]+$')
 CERT_NAME = re.compile(r'^[A-Za-z0-9_.-]{1,253}$')
+ROUTE_PATH = re.compile(r'^/[a-z0-9][a-z0-9_-]{0,62}$')
 
 def run(args, check=True):
     p = subprocess.run(args, text=True, capture_output=True)
@@ -14,9 +18,33 @@ def run(args, check=True):
         raise RuntimeError((p.stderr or p.stdout).strip() or f'{args[0]} ebaõnnestus')
     return p
 
+def sync_certificate_acme():
+    if CERTIFICATES_HELPER.is_file():
+        subprocess.run([str(CERTIFICATES_HELPER)],input='{"action":"sync_acme"}',text=True,capture_output=True,timeout=30)
+
 def load():
     if not DB.exists(): return []
     data=json.loads(DB.read_text())
+    if not isinstance(data,list): return []
+    result=[]
+    for item in data:
+        if not isinstance(item,dict): continue
+        value=dict(item)
+        try: value['id']=str(uuid.UUID(str(value.get('id'))))
+        except (ValueError,AttributeError,TypeError):
+            legacy=json.dumps({key:value.get(key) for key in ('domain','scheme','host','port','https_port')},sort_keys=True)
+            value['id']=str(uuid.uuid5(uuid.NAMESPACE_URL,f'cockpit-reverseproxy:{legacy}'))
+        result.append(value)
+    return result
+
+def load_routes():
+    if not ROUTES_DB.exists(): return []
+    data=json.loads(ROUTES_DB.read_text())
+    return data if isinstance(data,list) else []
+
+def load_route_hosts():
+    if not ROUTE_HOSTS_DB.exists(): return []
+    data=json.loads(ROUTE_HOSTS_DB.read_text())
     return data if isinstance(data,list) else []
 
 def validate(s):
@@ -34,7 +62,9 @@ def validate(s):
     if not 1 <= https_port <= 65535 or https_port == 80: raise ValueError('Vigane HTTPS port')
     certificate=str(s.get('certificate','')).strip()
     if certificate and (not CERT_NAME.fullmatch(certificate) or not has_cert(certificate)): raise ValueError('Valitud sertifikaati ei leitud')
-    return {'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True))}
+    try: site_id=str(uuid.UUID(str(s.get('id')))) if s.get('id') else str(uuid.uuid4())
+    except (ValueError,AttributeError): raise ValueError('Teenuse ID ei ole korrektne')
+    return {'id':site_id,'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True))}
 
 def has_cert(name):
     return bool(name and CERT_NAME.fullmatch(name) and Path('/etc/letsencrypt/live',name,'fullchain.pem').exists())
@@ -44,29 +74,172 @@ def cert_expiry(name):
     p=run(['/usr/bin/openssl','x509','-enddate','-noout','-in',f'/etc/letsencrypt/live/{name}/fullchain.pem'],False)
     return p.stdout.strip().removeprefix('notAfter=')
 
+def cert_domains(name):
+    if not has_cert(name): return []
+    p=run(['/usr/bin/openssl','x509','-in',f'/etc/letsencrypt/live/{name}/fullchain.pem','-noout','-ext','subjectAltName'],False)
+    return re.findall(r'DNS:([^,\s]+)',p.stdout)
+
+def certificate_for_domain(domain):
+    for item in certificates():
+        if domain in item.get('domains',[]): return item['name']
+    return ''
+
 def certificates():
     live=Path('/etc/letsencrypt/live')
     if not live.exists(): return []
-    return [{'name':p.name,'expiry':cert_expiry(p.name)} for p in sorted(live.iterdir()) if p.name!='README' and has_cert(p.name)]
+    return [{'name':p.name,'expiry':cert_expiry(p.name),'domains':cert_domains(p.name)} for p in sorted(live.iterdir()) if p.name!='README' and has_cert(p.name)]
 
-def generate(sites):
+def site_certificate(site):
+    domain=site['domain']
+    return site.get('certificate') or (domain if has_cert(domain) else '')
+
+def validate_sites(sites):
+    ids=set(); endpoints=set(); plain_domains=set()
+    for site in sites:
+        try: site_id=str(uuid.UUID(str(site.get('id'))))
+        except (ValueError,AttributeError,TypeError): raise ValueError('Teenuse ID ei ole korrektne')
+        if site_id in ids: raise ValueError('Teenuse ID on juba kasutuses')
+        ids.add(site_id)
+        endpoint=(site['domain'],int(site.get('https_port',443)))
+        if endpoint in endpoints: raise ValueError(f'Domeenil {site["domain"]} on HTTPS port {endpoint[1]} juba kasutuses')
+        endpoints.add(endpoint)
+        if not has_cert(site_certificate(site)):
+            if site['domain'] in plain_domains: raise ValueError(f'Domeenil {site["domain"]} saab olla ainult üks HTTP teenus')
+            plain_domains.add(site['domain'])
+
+def site_groups(sites):
+    validate_sites(sites)
+    groups={}
+    for site in sites:
+        if site['enabled']: groups.setdefault(site['domain'],[]).append(site)
+    return groups
+
+def validate_route(route):
+    domain=str(route.get('domain','')).lower().strip()
+    path=str(route.get('path','')).lower().strip().rstrip('/')
+    host=str(route.get('host','')).strip()
+    scheme=route.get('scheme','http')
+    try: port=int(route.get('port'))
+    except Exception: raise ValueError('Vigane sihtport')
+    try: https_port=int(route.get('https_port',443))
+    except Exception: raise ValueError('Vigane HTTPS port')
+    if not DOMAIN.fullmatch(domain): raise ValueError('Vigane domeeninimi')
+    if not ROUTE_PATH.fullmatch(path): raise ValueError('Alamrada peab olema kujul /rakendus')
+    if not HOST.fullmatch(host): raise ValueError('Vigane sihtserver')
+    if scheme not in ('http','https'): raise ValueError('Vigane protokoll')
+    if not 1 <= port <= 65535: raise ValueError('Port peab olema 1–65535')
+    if not 1 <= https_port <= 65535 or https_port == 80: raise ValueError('Vigane HTTPS port')
+    certificate=str(route.get('certificate','')).strip() or certificate_for_domain(domain)
+    if certificate and (not CERT_NAME.fullmatch(certificate) or not has_cert(certificate)): raise ValueError('Valitud sertifikaati ei leitud')
+    if certificate and domain not in cert_domains(certificate): raise ValueError('Valitud sertifikaat ei sisalda marsruudi domeeni')
+    description=str(route.get('description','')).strip()[:160]
+    try: route_id=str(uuid.UUID(str(route.get('id')))) if route.get('id') else str(uuid.uuid4())
+    except (ValueError,AttributeError): raise ValueError('Marsruudi ID ei ole korrektne')
+    managed_by='pm2' if route.get('managed_by')=='pm2' else ''
+    owner_user=str(route.get('owner_user','')).strip() if managed_by else ''
+    owner_app=str(route.get('owner_app','')).strip() if managed_by else ''
+    if managed_by and (not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}',owner_user) or not owner_app or len(owner_app)>100):
+        raise ValueError('PM2 marsruudi omanik ei ole korrektne')
+    return {'id':route_id,'domain':domain,'path':path,'scheme':scheme,'host':host,'port':port,
+            'https_port':https_port,'certificate':certificate,'websocket':bool(route.get('websocket',True)),
+            'strip_prefix':bool(route.get('strip_prefix',True)),'enabled':bool(route.get('enabled',True)),'description':description,
+            'managed_by':managed_by,'owner_user':owner_user,'owner_app':owner_app}
+
+def validate_route_host(item):
+    domain=str(item.get('domain','')).lower().strip()
+    if not DOMAIN.fullmatch(domain): raise ValueError('Vigane ühisdomeeni nimi')
+    try: https_port=int(item.get('https_port',443))
+    except Exception: raise ValueError('Vigane HTTPS port')
+    if not 1 <= https_port <= 65535 or https_port == 80: raise ValueError('Vigane HTTPS port')
+    certificate=str(item.get('certificate','')).strip() or certificate_for_domain(domain)
+    if certificate and (not has_cert(certificate) or domain not in cert_domains(certificate)): raise ValueError('Sertifikaat ei sisalda ühisdomeeni nime')
+    return {'domain':domain,'https_port':https_port,'certificate':certificate,'enabled':bool(item.get('enabled',True))}
+
+def proxy_location(target, websocket=True, indent='        '):
+    lines=[f'{indent}proxy_pass {target};',f'{indent}proxy_http_version 1.1;',f'{indent}proxy_set_header Host $host;',
+           f'{indent}proxy_set_header X-Real-IP $remote_addr;',f'{indent}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+           f'{indent}proxy_set_header X-Forwarded-Proto $scheme;',f'{indent}proxy_set_header X-Forwarded-Host $host;',
+           f'{indent}proxy_read_timeout 3600s;',f'{indent}proxy_send_timeout 3600s;',f'{indent}proxy_buffering off;']
+    if websocket:
+        lines += [f'{indent}proxy_set_header Upgrade $http_upgrade;',f'{indent}proxy_set_header Connection $connection_upgrade;']
+    return lines
+
+def route_locations(routes):
+    out=[]
+    for route in sorted(routes,key=lambda item:len(item['path']),reverse=True):
+        path=route['path']; target=f"{route['scheme']}://{route['host']}:{route['port']}"
+        out += [f'    location = {path} {{ return 308 {path}/$is_args$args; }}',f'    location ^~ {path}/ {{']
+        out += proxy_location(target+'/' if route['strip_prefix'] else target,route['websocket'])
+        out += [f'        proxy_set_header X-Forwarded-Prefix {path};',f'        proxy_set_header X-Original-URI $request_uri;']
+        if route['strip_prefix']:
+            out += [f'        proxy_cookie_path / {path}/;',f'        proxy_redirect ~^https?://[^/]+(/.*)$ {path}$1;',f'        proxy_redirect ~^(/.*)$ {path}$1;']
+        out += ['    }']
+    return out
+
+def route_groups(routes,sites,hosts=None):
+    hosts=load_route_hosts() if hosts is None else hosts
+    site_domains={site['domain'] for site in sites}
+    groups={}
+    for host in hosts:
+        if not host['enabled']: continue
+        if host['domain'] in site_domains: raise ValueError(f"Domeen {host['domain']} on juba täisdomeeni proxy kasutuses")
+        groups[host['domain']]={'routes':[],'certificate':host['certificate'] or certificate_for_domain(host['domain']),'https_port':host['https_port']}
+    for route in routes:
+        if not route['enabled']: continue
+        if route['domain'] in site_domains: raise ValueError(f"Domeen {route['domain']} on juba täisdomeeni proxy kasutuses")
+        route_certificate=route['certificate'] or certificate_for_domain(route['domain'])
+        group=groups.setdefault(route['domain'],{'routes':[],'certificate':route_certificate,'https_port':route['https_port']})
+        if group['certificate']!=route_certificate or group['https_port']!=route['https_port']:
+            raise ValueError(f'Domeeni {route["domain"]} marsruutidel peavad olema sama HTTPS port ja sertifikaat')
+        group['routes'].append(route)
+    for domain,group in groups.items():
+        items=group['routes']
+        paths=[item['path'] for item in items]
+        if len(paths)!=len(set(paths)): raise ValueError(f'Domeenil {domain} on korduv alamrada')
+    return groups
+
+def generate(sites,routes=None,hosts=None):
+    routes=load_routes() if routes is None else routes
     out=['# Managed by Cockpit Reverse Proxy. Do not edit manually.','map $http_upgrade $connection_upgrade {','    default upgrade;','    \'\' close;','}','']
-    for s in sites:
-        if not s['enabled']: continue
-        d=s['domain']; target=f"{s['scheme']}://{s['host']}:{s['port']}"; tls_port=int(s.get('https_port',443)); cert_name=s.get('certificate') or (d if has_cert(d) else '')
-        out += ['server {','    listen 80;','    listen [::]:80;',f'    server_name {d};','    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }']
+    for domain,items in site_groups(sites).items():
+        plain=next((site for site in items if not has_cert(site_certificate(site))),None)
+        tls=sorted((site for site in items if has_cert(site_certificate(site))),key=lambda site:(int(site.get('https_port',443))!=443,int(site.get('https_port',443))))
+        out += ['server {','    listen 80;','    listen [::]:80;',f'    server_name {domain};','    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }']
+        if plain:
+            target=f"{plain['scheme']}://{plain['host']}:{plain['port']}"
+            out += ['    client_max_body_size 0;','    location / {']
+            out += proxy_location(target,plain['websocket'])
+            out += ['    }','}','']
+        elif tls:
+            primary_port=int(tls[0].get('https_port',443))
+            redirect='https://$host$request_uri' if primary_port==443 else f'https://$host:{primary_port}$request_uri'
+            out += [f'    location / {{ return 301 {redirect}; }}','}','']
+        else:
+            out += ['    location / { return 404; }','}','']
+        for site in tls:
+            target=f"{site['scheme']}://{site['host']}:{site['port']}"; tls_port=int(site.get('https_port',443)); cert_name=site_certificate(site)
+            out += ['server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {domain};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;','    client_max_body_size 0;','    location / {']
+            out += proxy_location(target,site['websocket'])
+            out += ['    }','}','']
+    for domain,group in route_groups(routes,sites,hosts).items():
+        items=group['routes']; tls_port=group['https_port']; cert_name=group['certificate']
+        out += ['server {','    listen 80;','    listen [::]:80;',f'    server_name {domain};','    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }']
         if has_cert(cert_name):
             redirect='https://$host$request_uri' if tls_port==443 else f'https://$host:{tls_port}$request_uri'
-            out += [f'    location / {{ return 301 {redirect}; }}','}','', 'server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {d};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;']
-        out += ['    client_max_body_size 0;','    location / {',f'        proxy_pass {target};','        proxy_http_version 1.1;','        proxy_set_header Host $host;','        proxy_set_header X-Real-IP $remote_addr;','        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;','        proxy_set_header X-Forwarded-Proto $scheme;','        proxy_read_timeout 3600s;','        proxy_send_timeout 3600s;','        proxy_buffering off;']
-        if s['websocket']:
-            out += ['        proxy_set_header Upgrade $http_upgrade;','        proxy_set_header Connection $connection_upgrade;']
-        out += ['    }','}','']
+            out += [f'    location / {{ return 301 {redirect}; }}','}','', 'server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {domain};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;','    client_max_body_size 0;']
+            out += route_locations(items)
+            out += ['    location / { return 404; }','}','']
+        else:
+            out += ['    client_max_body_size 0;']
+            out += route_locations(items)
+            out += ['    location / { return 404; }','}','']
     return '\n'.join(out)
 
-def persist(sites):
+def persist(sites,routes=None,hosts=None):
+    routes=load_routes() if routes is None else routes
+    hosts=load_route_hosts() if hosts is None else hosts
     DB.parent.mkdir(mode=0o750,parents=True,exist_ok=True)
-    conf=generate(sites)
+    conf=generate(sites,routes,hosts)
     old=CONF.read_text() if CONF.exists() else None
     with tempfile.NamedTemporaryFile('w',dir=CONF.parent,delete=False) as f: f.write(conf); tmp=f.name
     os.chmod(tmp,0o644); os.replace(tmp,CONF)
@@ -77,24 +250,59 @@ def persist(sites):
         raise RuntimeError((p.stderr or p.stdout).strip())
     with tempfile.NamedTemporaryFile('w',dir=DB.parent,delete=False) as f: json.dump(sites,f,indent=2); f.write('\n'); tmp=f.name
     os.chmod(tmp,0o640); os.replace(tmp,DB)
+    with tempfile.NamedTemporaryFile('w',dir=ROUTES_DB.parent,delete=False) as f: json.dump(routes,f,indent=2); f.write('\n'); tmp=f.name
+    os.chmod(tmp,0o640); os.replace(tmp,ROUTES_DB)
+    with tempfile.NamedTemporaryFile('w',dir=ROUTE_HOSTS_DB.parent,delete=False) as f: json.dump(hosts,f,indent=2); f.write('\n'); tmp=f.name
+    os.chmod(tmp,0o640); os.replace(tmp,ROUTE_HOSTS_DB)
     run(['/bin/systemctl','reload','nginx'])
+    sync_certificate_acme()
 
 def main(req):
-    action=req.get('action'); sites=load()
+    action=req.get('action'); sites=load(); routes=load_routes(); route_hosts=load_route_hosts()
     if action=='list':
         enriched=[]
         for s in sites:
-            cert_name=s.get('certificate') or (s['domain'] if has_cert(s['domain']) else '')
+            cert_name=site_certificate(s)
             enriched.append(dict(s,certificate=cert_name,https=has_cert(cert_name),cert_expiry=cert_expiry(cert_name)))
-        return {'sites':enriched,'certificates':certificates(),'active':run(['/bin/systemctl','is-active','nginx'],False).returncode==0}
+        route_data=[]
+        for route in routes:
+            route_cert=route.get('certificate','') or certificate_for_domain(route['domain'])
+            route_data.append(dict(route,certificate=route_cert,https=has_cert(route_cert),cert_expiry=cert_expiry(route_cert)))
+        host_data=[dict(host,https=has_cert(host.get('certificate','') or certificate_for_domain(host['domain']))) for host in route_hosts]
+        return {'sites':enriched,'routes':route_data,'route_hosts':host_data,'certificates':certificates(),'active':run(['/bin/systemctl','is-active','nginx'],False).returncode==0}
     if action=='save':
-        s=validate(req.get('site',{})); original=req.get('original_domain','')
-        if original and original!=s['domain']: sites=[x for x in sites if x['domain']!=original]
-        if any(x['domain']==s['domain'] for x in sites): sites=[s if x['domain']==s['domain'] else x for x in sites]
-        else: sites.append(s)
-        persist(sites); return {'ok':True}
+        s=validate(req.get('site',{})); original=str(req.get('original_id') or s['id'])
+        try: original=str(uuid.UUID(original))
+        except (ValueError,AttributeError): raise ValueError('Teenuse ID ei ole korrektne')
+        exists=any(item.get('id')==original for item in sites)
+        if exists: s['id']=original
+        candidate=[s if item.get('id')==original else item for item in sites]
+        if not exists: candidate.append(s)
+        validate_sites(candidate); persist(candidate); return {'ok':True,'site':s}
     if action=='delete':
-        domain=req.get('domain',''); persist([s for s in sites if s['domain']!=domain]); return {'ok':True}
+        site_id=str(req.get('id') or '')
+        site=next((item for item in sites if item.get('id')==site_id),None)
+        if not site: raise ValueError('Teenust ei leitud')
+        persist([item for item in sites if item.get('id')!=site_id]); return {'ok':True}
+    if action in ('route_validate','route_save'):
+        route=validate_route(req.get('route',{})); original_id=str(req.get('original_id') or route['id'])
+        candidate=[route if item.get('id')==original_id else item for item in routes]
+        if not any(item.get('id')==original_id for item in routes): candidate.append(route)
+        host=validate_route_host({'domain':route['domain'],'https_port':route['https_port'],'certificate':route['certificate'],'enabled':True})
+        candidate_hosts=[host if item.get('domain')==host['domain'] else item for item in route_hosts]
+        if not any(item.get('domain')==host['domain'] for item in route_hosts): candidate_hosts.append(host)
+        route_groups(candidate,sites,candidate_hosts)
+        if action=='route_save': persist(sites,candidate,candidate_hosts)
+        return {'ok':True,'route':route}
+    if action=='route_host_save':
+        host=validate_route_host(req.get('host',{})); candidate=[host if item.get('domain')==host['domain'] else item for item in route_hosts]
+        if not any(item.get('domain')==host['domain'] for item in route_hosts): candidate.append(host)
+        route_groups(routes,sites,candidate); persist(sites,routes,candidate); return {'ok':True,'host':host}
+    if action=='route_delete':
+        route_id=str(req.get('id') or '')
+        route=next((item for item in routes if item.get('id')==route_id),None)
+        if not route: raise ValueError('Marsruuti ei leitud')
+        persist(sites,[item for item in routes if item.get('id')!=route_id]); return {'ok':True}
     if action=='test':
         p=run(['/usr/sbin/nginx','-t']); return {'message':(p.stderr or p.stdout).strip()}
     if action=='reload': run(['/usr/sbin/nginx','-t']); run(['/bin/systemctl','reload','nginx']); return {'ok':True}
@@ -102,16 +310,24 @@ def main(req):
     if action=='logs':
         p=run(['/usr/bin/journalctl','-u','nginx','-n','80','--no-pager'],False); return {'logs':p.stdout[-16000:]}
     if action=='health':
-        domain=req.get('domain',''); s=next((x for x in sites if x['domain']==domain),None)
-        if not s: raise ValueError('Tundmatu domeen')
+        site_id=str(req.get('id') or ''); s=next((item for item in sites if item.get('id')==site_id),None)
+        if not s: raise ValueError('Teenust ei leitud')
         url=f"{s['scheme']}://{s['host']}:{s['port']}/"
+        p=run(['/usr/bin/curl','-k','-sS','-o','/dev/null','--connect-timeout','4','--max-time','8','-w','%{http_code} %{time_total}',url],False)
+        if p.returncode: raise RuntimeError(p.stderr.strip() or 'Sihtteenus ei vasta')
+        code,seconds=p.stdout.split(); return {'code':code,'time_ms':round(float(seconds)*1000)}
+    if action=='route_health':
+        route_id=str(req.get('id') or ''); route=next((item for item in routes if item.get('id')==route_id),None)
+        if not route: raise ValueError('Marsruuti ei leitud')
+        url=f"{route['scheme']}://{route['host']}:{route['port']}/"
         p=run(['/usr/bin/curl','-k','-sS','-o','/dev/null','--connect-timeout','4','--max-time','8','-w','%{http_code} %{time_total}',url],False)
         if p.returncode: raise RuntimeError(p.stderr.strip() or 'Sihtteenus ei vasta')
         code,seconds=p.stdout.split(); return {'code':code,'time_ms':round(float(seconds)*1000)}
     raise ValueError('Tundmatu toiming')
 
-try:
-    req=json.loads(sys.stdin.read() or '{}')
-    print(json.dumps(main(req),ensure_ascii=False))
-except Exception as e:
-    print(json.dumps({'error':str(e)},ensure_ascii=False))
+if __name__=='__main__':
+    try:
+        req=json.loads(sys.stdin.read() or '{}')
+        print(json.dumps(main(req),ensure_ascii=False))
+    except Exception as e:
+        print(json.dumps({'error':str(e)},ensure_ascii=False))

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="et">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PM2 rakendused</title>
+  <link rel="stylesheet" href="../base1/patternfly.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="../base1/cockpit.js"></script>
+</head>
+<body>
+  <div id="toast" class="toast hidden"></div>
+  <header>
+    <div class="brand"><span class="logo">P2</span><div><span class="eyebrow">RAKENDUSTE HALDUS</span><h1>PM2</h1><p id="subtitle">Protsessid, jõudlus ja logid</p></div></div>
+    <div class="header-actions">
+      <label class="user-picker"><span>Kasutaja</span><select id="user-select" aria-label="PM2 kasutaja"></select></label>
+      <span id="health" class="status loading">Kontrollin</span>
+      <button id="refresh" class="header-button">↻ Värskenda</button>
+    </div>
+  </header>
+  <nav id="nav">
+    <button class="active" data-view="overview">Ülevaade</button>
+    <button data-view="apps">Rakendused</button>
+    <button data-view="logs">Reaalajalogid</button>
+    <button data-view="startup">Autostart</button>
+    <button data-view="activity">Tegevuslogi</button>
+  </nav>
+  <main>
+    <div id="loading" class="loading"><span class="spinner"></span><span>Laen PM2 olekut…</span></div>
+    <section id="content" class="hidden"></section>
+  </main>
+
+  <dialog id="app-dialog"><form id="app-form">
+    <div class="dialog-head"><div><span class="eyebrow">UUS RAKENDUS</span><h2>Lisa PM2 rakendus</h2><p>Rakendus käivitatakse valitud Linuxi kasutajana.</p></div><button type="button" class="icon-button" data-close-app>×</button></div>
+    <div class="form-grid">
+      <label class="field"><span>Nimi</span><input name="name" required maxlength="100" placeholder="minu-rakendus"></label>
+      <label class="field"><span>Töökataloog</span><input name="cwd" required placeholder="/home/kasutaja/Projects/App"></label>
+      <label class="field wide"><span>Käivitusfail</span><input name="script" required placeholder="dist/index.js"><small>Absoluutne tee või töökataloogi suhtes.</small></label>
+      <label class="field"><span>Interpretaator</span><select name="interpreter"><option value="">Automaatne</option><option value="node">Node.js</option><option value="python3">Python 3</option><option value="bash">Bash</option><option value="none">Käivitatav fail</option></select></label>
+      <label class="field"><span>Režiim</span><select name="mode"><option value="fork">Fork</option><option value="cluster">Cluster</option></select></label>
+      <label class="field"><span>Instantse</span><input name="instances" type="number" min="1" max="64" value="1"></label>
+      <label class="field"><span>Mälupiirang</span><input name="max_memory" placeholder="500M"><small>Valikuline, nt 500M või 2G.</small></label>
+      <label class="field wide"><span>Argumendid</span><input name="arguments" placeholder="--port 3000 --verbose"><small>Käsurea argumendid; jutumärgid on toetatud.</small></label>
+      <label class="field wide"><span>Keskkonnamuutujad</span><textarea name="environment" rows="4" placeholder="NODE_ENV=production&#10;PORT=3000"></textarea><small>Üks KEY=value rea kohta. Väärtusi pärast salvestamist UI-s ei näidata.</small></label>
+    </div>
+    <div class="option-row"><label><input name="autorestart" type="checkbox" checked> Taaskäivita vea korral</label><label><input name="watch" type="checkbox"> Jälgi failimuudatusi</label></div>
+    <section class="publish-card">
+      <label class="publish-toggle"><span><strong>Avalda reverse proxy kaudu</strong><small>Loo rakendusele HTTPS-aadress ühisdomeeni alamrajal.</small></span><input name="publish" type="checkbox"></label>
+      <div id="publish-fields" class="form-grid hidden">
+        <label class="field"><span>Avalik domeen</span><input name="public_domain" placeholder="server.example.ee"></label>
+        <label class="field"><span>Alamrada</span><input name="public_path" placeholder="/rakendus" pattern="/[a-z0-9][a-z0-9_-]*"><small>Lõpuslash lisatakse automaatselt.</small></label>
+        <label class="field"><span>Rakenduse kohalik port</span><input name="public_port" type="number" min="1024" max="65535" placeholder="3000"><small>Lisatakse rakendusele PORT muutujana.</small></label>
+        <div class="field route-options"><label><input name="strip_prefix" type="checkbox" checked> Eemalda prefiks</label><label><input name="public_websocket" type="checkbox" checked> WebSocketid</label></div>
+        <p class="field wide publish-hint">Frontend-rakenduse absoluutsete <code>/assets</code> ja <code>/api</code> aadresside korral määra rakenduses baasrajaks sama alamrada.</p>
+      </div>
+    </section>
+    <div class="dialog-actions"><button type="button" class="button" data-close-app>Loobu</button><button id="app-submit" class="button primary">Lisa ja käivita</button></div>
+  </form></dialog>
+
+  <dialog id="detail-dialog">
+    <div class="dialog-head"><div><span class="eyebrow">PROTSESSI DETAILID</span><h2 id="detail-title"></h2></div><button type="button" class="icon-button" data-close-detail>×</button></div>
+    <div id="detail-content"></div>
+    <div class="dialog-actions"><button class="button" data-close-detail>Sulge</button></div>
+  </dialog>
+
+  <dialog id="confirm-dialog"><form id="confirm-form">
+    <div class="danger-icon">!</div><h2 id="confirm-title"></h2><p id="confirm-text"></p>
+    <label class="field"><span id="confirm-prompt"></span><input id="confirm-input" autocomplete="off"></label>
+    <div class="dialog-actions"><button type="button" class="button" data-close-confirm>Loobu</button><button id="confirm-submit" class="button danger">Kinnita</button></div>
+  </form></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -22,6 +22,8 @@ LIVE = Path('/etc/letsencrypt/live')
 ACME_CONF = Path('/etc/nginx/conf.d/cockpit-certificates-acme.conf')
 WEBROOT = Path('/var/www/certbot')
 PROXY_DB = Path('/etc/cockpit-reverseproxy/sites.json')
+PROXY_ROUTES_DB = Path('/etc/cockpit-reverseproxy/routes.json')
+PROXY_ROUTE_HOSTS_DB = Path('/etc/cockpit-reverseproxy/route-hosts.json')
 DOMAIN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
 CERT_NAME = re.compile(r'^[A-Za-z0-9_.-]{1,253}$')
 HOST = re.compile(r'^[A-Za-z0-9_.:-]{1,253}$')
@@ -88,6 +90,31 @@ def proxy_sites():
         return []
 
 
+def proxy_route_domains():
+    domains = set()
+    for path in (PROXY_ROUTES_DB, PROXY_ROUTE_HOSTS_DB):
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, list):
+                domains.update(str(item.get('domain', '')).lower() for item in data
+                               if isinstance(item, dict) and item.get('enabled', True))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+    return domains
+
+
+def proxy_route_items():
+    items = []
+    for path in (PROXY_ROUTES_DB, PROXY_ROUTE_HOSTS_DB):
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, list):
+                items.extend(item for item in data if isinstance(item, dict) and item.get('enabled', True))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+    return items
+
+
 def certificate_path(name):
     return LIVE / name
 
@@ -141,6 +168,12 @@ def all_certificates(config=None):
             selected = site.get('certificate') or (site.get('domain') if certificate_exists(site.get('domain', '')) else '')
             if selected == name:
                 in_use.append(site.get('domain', ''))
+        for route in proxy_route_items():
+            domain = route.get('domain', '')
+            selected = route.get('certificate', '')
+            if selected == name or (not selected and domain in details['domains']):
+                in_use.append(domain + (route.get('path', '') if route.get('path') else ''))
+        in_use = list(dict.fromkeys(in_use))
         details.update({
             'managed': name in config['certificates'],
             'in_use_by': in_use,
@@ -179,7 +212,7 @@ def managed_domains(config):
 
 
 def write_acme_config(config):
-    proxy_domains = {str(site.get('domain', '')).lower() for site in proxy_sites() if site.get('enabled', True)}
+    proxy_domains = {str(site.get('domain', '')).lower() for site in proxy_sites() if site.get('enabled', True)} | proxy_route_domains()
     domains = sorted(managed_domains(config) - proxy_domains)
     lines = ['# Managed by Cockpit Certificates. Do not edit manually.']
     if domains:
@@ -454,6 +487,9 @@ def main(request):
             'synology': synology_settings_public(config['synology']),
             'nginx_active': run(['/bin/systemctl', 'is-active', 'nginx'], False).returncode == 0,
         }
+    if action == 'sync_acme':
+        write_acme_config(config)
+        return {'ok': True}
     if action == 'timer_set':
         enabled = request.get('enabled') is True
         run(['/bin/systemctl', 'enable', '--now', 'certbot.timer'] if enabled else ['/bin/systemctl', 'disable', '--now', 'certbot.timer'])

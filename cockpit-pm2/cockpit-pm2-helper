@@ -1,0 +1,528 @@
+#!/usr/bin/python3
+import datetime
+import json
+import os
+import pwd
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+AUDIT_LOG = Path('/var/log/cockpit-pm2-audit.jsonl')
+SAFE_USER = re.compile(r'^[a-z_][a-z0-9_-]{0,31}$')
+SAFE_NAME = re.compile(r'^[\w .:@()+-]{1,100}$', re.UNICODE)
+SAFE_MEMORY = re.compile(r'^\d{1,6}(?:K|M|G)$', re.I)
+SAFE_ENV_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+RESERVED_ENV = {'HOME', 'USER', 'LOGNAME', 'PM2_HOME'}
+SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+REVERSE_PROXY_HELPER = Path('/usr/local/libexec/cockpit-reverseproxy-helper')
+REVERSE_PROXY_ROUTES = Path('/etc/cockpit-reverseproxy/routes.json')
+
+
+def run(args, check=True, timeout=45, env=None):
+    proc = subprocess.run(args, text=True, capture_output=True, timeout=timeout,
+                          env={**os.environ, 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', **(env or {})})
+    if check and proc.returncode:
+        message = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(message[-4000:] if message else f'{args[0]} ebaõnnestus')
+    return proc
+
+
+def audit(action, user='', target='', ok=True):
+    try:
+        record = {'time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  'actor': os.getenv('COCKPIT_USER') or os.getenv('USER', 'unknown'),
+                  'user': user, 'action': action, 'target': target, 'ok': ok}
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG.open('a') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+        os.chmod(AUDIT_LOG, 0o600)
+    except Exception:
+        pass
+
+
+def eligible_accounts():
+    accounts = []
+    for account in pwd.getpwall():
+        shell = account.pw_shell or ''
+        home = Path(account.pw_dir)
+        if account.pw_uid < 1000 or not SAFE_USER.fullmatch(account.pw_name):
+            continue
+        if shell.endswith(('nologin', 'false')) or not home.is_absolute() or not home.is_dir():
+            continue
+        accounts.append(account)
+    return sorted(accounts, key=lambda item: (item.pw_uid, item.pw_name.casefold()))
+
+
+def account_for(username):
+    username = str(username or '').strip()
+    account = next((item for item in eligible_accounts() if item.pw_name == username), None)
+    if not account:
+        raise ValueError('Valitud kasutajat ei leitud või see ei ole interaktiivne kasutaja')
+    return account
+
+
+def pm2_path(account):
+    home = Path(account.pw_dir)
+    candidates = [Path('/usr/local/bin/pm2'), Path('/usr/bin/pm2'), home / '.local/bin/pm2']
+    candidates.extend(sorted((home / '.nvm/versions/node').glob('*/bin/pm2'), reverse=True))
+    available = [path for path in candidates if path.is_file() and os.access(path, os.X_OK)]
+    if not available:
+        return None
+    nvm = [path for path in available if '/.nvm/' in str(path)]
+    if nvm:
+        def version(path):
+            return tuple(int(value) for value in re.findall(r'\d+', path.parents[1].name))
+        return max(nvm, key=version)
+    return available[0]
+
+
+def user_environment(account, executable, extra=None):
+    home = account.pw_dir
+    path_parts = [str(executable.parent), f'{home}/.local/bin', SYSTEM_PATH]
+    return {'HOME': home, 'USER': account.pw_name, 'LOGNAME': account.pw_name,
+            'PM2_HOME': f'{home}/.pm2', 'PATH': ':'.join(path_parts), **(extra or {})}
+
+
+def run_pm2(username, args, check=True, timeout=45, extra_env=None):
+    account = account_for(username)
+    executable = pm2_path(account)
+    if not executable:
+        raise RuntimeError(f'Kasutajale {username} ei ole PM2 paigaldatud')
+    env = user_environment(account, executable, extra_env)
+    command = ['/usr/sbin/runuser', '-u', account.pw_name, '--', '/usr/bin/env']
+    command.extend(f'{key}={value}' for key, value in env.items())
+    command.extend([str(executable), *[str(arg) for arg in args]])
+    return run(command, check, timeout)
+
+
+def reverse_proxy(payload):
+    if not REVERSE_PROXY_HELPER.is_file():
+        raise RuntimeError('Reverse Proxy moodulit ei ole paigaldatud')
+    result = subprocess.run([str(REVERSE_PROXY_HELPER)], input=json.dumps(payload), text=True, capture_output=True, timeout=45)
+    try:
+        response = json.loads(result.stdout or '{}')
+    except json.JSONDecodeError:
+        response = {}
+    if result.returncode or response.get('error'):
+        raise RuntimeError(response.get('error') or result.stderr.strip() or 'Reverse Proxy seadistamine ebaõnnestus')
+    return response
+
+
+def reverse_proxy_routes():
+    try:
+        data = json.loads(REVERSE_PROXY_ROUTES.read_text())
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def user_can_access(account, path, permission):
+    if permission not in ('r', 'x'):
+        return False
+    return run(['/usr/sbin/runuser', '-u', account.pw_name, '--', '/usr/bin/test', f'-{permission}', str(path)], False).returncode == 0
+
+
+def service_state(username):
+    unit = f'pm2-{username}.service'
+    enabled = run(['/usr/bin/systemctl', 'is-enabled', unit], False).returncode == 0
+    active = run(['/usr/bin/systemctl', 'is-active', unit], False).returncode == 0
+    return {'unit': unit, 'enabled': enabled, 'active': active}
+
+
+def process_alive(pid_file):
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def users():
+    result = []
+    for account in eligible_accounts():
+        executable = pm2_path(account)
+        pm2_home = Path(account.pw_dir) / '.pm2'
+        service = service_state(account.pw_name)
+        result.append({'name': account.pw_name, 'display_name': account.pw_gecos.split(',')[0] or account.pw_name,
+                       'home': account.pw_dir, 'uid': account.pw_uid, 'installed': bool(executable),
+                       'pm2_path': str(executable or ''), 'configured': pm2_home.is_dir(),
+                       'daemon': process_alive(pm2_home / 'pm2.pid'), 'startup': service['enabled']})
+    return result
+
+
+def selected_user(request):
+    available = users()
+    requested = str(request.get('user') or '').strip()
+    if requested:
+        if any(item['name'] == requested for item in available):
+            return requested
+        raise ValueError('Valitud kasutaja ei ole PM2 halduseks lubatud')
+    configured = next((item['name'] for item in available if item['configured'] and item['installed']), None)
+    installed = next((item['name'] for item in available if item['installed']), None)
+    if configured or installed:
+        return configured or installed
+    raise RuntimeError('Ühelgi tavakasutajal ei ole PM2 paigaldatud')
+
+
+def pm2_json(username):
+    result = run_pm2(username, ['jlist'], False)
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip() or 'PM2 protsesside laadimine ebaõnnestus')
+    try:
+        return json.loads(result.stdout or '[]')
+    except json.JSONDecodeError:
+        raise RuntimeError('PM2 tagastas vigase protsessiloendi')
+
+
+def timestamp(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def integer(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def decimal(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def process_view(item):
+    env = item.get('pm2_env') or {}
+    monit = item.get('monit') or {}
+    return {'id': integer(item.get('pm_id'), -1), 'name': str(env.get('name') or item.get('name') or ''),
+            'namespace': str(env.get('namespace') or 'default'), 'status': str(env.get('status') or 'unknown'),
+            'pid': integer(item.get('pid')), 'cpu': decimal(monit.get('cpu')),
+            'memory': integer(monit.get('memory')), 'started': timestamp(env.get('pm_uptime')),
+            'created': timestamp(env.get('created_at')), 'restarts': integer(env.get('restart_time')),
+            'unstable_restarts': integer(env.get('unstable_restarts')),
+            'mode': str(env.get('exec_mode') or '').replace('_mode', ''),
+            'instances': integer(env.get('instances'), 1), 'script': str(env.get('pm_exec_path') or ''),
+            'cwd': str(env.get('pm_cwd') or ''), 'interpreter': str(env.get('exec_interpreter') or ''),
+            'node_version': str(env.get('node_version') or ''), 'version': str(env.get('version') or ''),
+            'watch': bool(env.get('watch')), 'autorestart': env.get('autorestart', True) is not False,
+            'max_memory_restart': integer(env.get('max_memory_restart'))}
+
+
+def process_list(username):
+    return sorted([process_view(item) for item in pm2_json(username)], key=lambda item: item['id'])
+
+
+def dump_info(account):
+    dump = Path(account.pw_dir) / '.pm2/dump.pm2'
+    count = 0
+    if dump.is_file():
+        try:
+            data = json.loads(dump.read_text())
+            count = len(data) if isinstance(data, list) else 0
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {'exists': dump.is_file(), 'count': count,
+            'modified': int(dump.stat().st_mtime * 1000) if dump.is_file() else 0}
+
+
+def snapshot(request, include_users=True):
+    username = selected_user(request)
+    account = account_for(username)
+    executable = pm2_path(account)
+    processes = process_list(username)
+    proxy_routes = reverse_proxy_routes()
+    public_urls = {item.get('owner_app'): f"https://{item.get('domain')}{item.get('path')}/" for item in proxy_routes
+                   if item.get('managed_by') == 'pm2' and item.get('owner_user') == username and item.get('enabled', True)}
+    for process in processes:
+        process['public_url'] = public_urls.get(process['name'], '')
+    online = sum(1 for item in processes if item['status'] == 'online')
+    memory = sum(item['memory'] for item in processes)
+    cpu = sum(item['cpu'] for item in processes)
+    version_output = run_pm2(username, ['--version'], False).stdout.strip().splitlines() if executable else []
+    version = version_output[-1] if version_output else ''
+    return {'selected_user': username, 'users': users() if include_users else [], 'processes': processes,
+            'summary': {'total': len(processes), 'online': online, 'stopped': len(processes) - online,
+                        'memory': memory, 'cpu': round(cpu, 1)}, 'version': version,
+            'pm2_home': f'{account.pw_dir}/.pm2', 'startup': service_state(username), 'dump': dump_info(account),
+            'public_domain': socket.getfqdn().lower()}
+
+
+def process_by_id(username, value):
+    try:
+        process_id = int(value)
+    except (TypeError, ValueError):
+        raise ValueError('Protsessi ID ei ole korrektne')
+    process = next((item for item in process_list(username) if item['id'] == process_id), None)
+    if not process:
+        raise ValueError('PM2 protsessi ei leitud')
+    return process
+
+
+def parse_environment(text):
+    values = {}
+    for number, raw in enumerate(str(text or '').splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            raise ValueError(f'Keskkonnamuutuja real {number} puudub = märk')
+        key, value = line.split('=', 1)
+        key = key.strip()
+        if not SAFE_ENV_NAME.fullmatch(key):
+            raise ValueError(f'Keskkonnamuutuja nimi real {number} ei ole korrektne')
+        if key in RESERVED_ENV:
+            raise ValueError(f'Keskkonnamuutujat {key} haldab PM2 moodul ise')
+        if len(value) > 4096:
+            raise ValueError(f'Keskkonnamuutuja väärtus real {number} on liiga pikk')
+        values[key] = value
+    if len(values) > 100:
+        raise ValueError('Keskkonnamuutujaid on liiga palju')
+    return values
+
+
+def add_application(username, request):
+    account = account_for(username)
+    name = str(request.get('name') or '').strip()
+    if not SAFE_NAME.fullmatch(name):
+        raise ValueError('Rakenduse nimi sisaldab lubamatuid märke')
+    if any(item['name'].casefold() == name.casefold() for item in process_list(username)):
+        raise ValueError('Selle nimega PM2 rakendus on juba olemas')
+    cwd = Path(str(request.get('cwd') or '').strip())
+    if not cwd.is_absolute() or not cwd.is_dir():
+        raise ValueError('Töökataloog peab olema olemasolev absoluutne kataloog')
+    script_text = str(request.get('script') or '').strip()
+    script = Path(script_text) if Path(script_text).is_absolute() else cwd / script_text
+    if not script.is_file():
+        raise ValueError('Käivitusfaili ei leitud')
+    if not user_can_access(account, cwd, 'x') or not user_can_access(account, script, 'r'):
+        raise ValueError('Käivitusfailile või töökataloogile puudub ligipääs')
+    try:
+        arguments = shlex.split(str(request.get('arguments') or ''))
+    except ValueError as error:
+        raise ValueError(f'Rakenduse argumendid ei ole korrektsed: {error}')
+    if len(arguments) > 100 or sum(map(len, arguments)) > 8192:
+        raise ValueError('Rakenduse argumente on liiga palju')
+    interpreter = str(request.get('interpreter') or '').strip()
+    if interpreter not in ('', 'node', 'python3', 'bash', 'none'):
+        raise ValueError('Valitud interpretaator ei ole lubatud')
+    try:
+        instances = int(request.get('instances') or 1)
+    except (TypeError, ValueError):
+        raise ValueError('Instantside arv ei ole korrektne')
+    if not 1 <= instances <= 64:
+        raise ValueError('Instantside arv peab olema 1–64')
+    mode = str(request.get('mode') or 'fork')
+    if mode not in ('fork', 'cluster'):
+        raise ValueError('Käivitusrežiim ei ole korrektne')
+    if mode == 'cluster' and interpreter not in ('', 'node'):
+        raise ValueError('Cluster-režiim on toetatud ainult Node.js rakendustele')
+    memory = str(request.get('max_memory') or '').strip().upper()
+    if memory and not SAFE_MEMORY.fullmatch(memory):
+        raise ValueError('Mälupiirang peab olema näiteks 500M või 2G')
+    command = ['start', str(script), '--name', name, '--cwd', str(cwd), '--time']
+    if interpreter:
+        command.extend(['--interpreter', interpreter])
+    if mode == 'cluster':
+        command.extend(['--exec-mode', 'cluster', '--instances', str(instances)])
+    if str(request.get('watch') or '').lower() in ('true', '1', 'on'):
+        command.append('--watch')
+    if str(request.get('autorestart') or '').lower() not in ('true', '1', 'on'):
+        command.append('--no-autorestart')
+    if memory:
+        command.extend(['--max-memory-restart', memory])
+    if arguments:
+        command.extend(['--', *arguments])
+    extra = parse_environment(request.get('environment'))
+    publish = str(request.get('publish') or '').lower() in ('true', '1', 'on')
+    route = None
+    if publish:
+        try:
+            public_port = int(request.get('public_port'))
+        except (TypeError, ValueError):
+            raise ValueError('Avaldatava rakenduse port ei ole korrektne')
+        if not 1024 <= public_port <= 65535:
+            raise ValueError('Avaldatava rakenduse port peab olema vahemikus 1024–65535')
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.3)
+            if probe.connect_ex(('127.0.0.1', public_port)) == 0:
+                raise ValueError(f'Port {public_port} on juba kasutusel')
+        if extra.get('PORT') not in (None, str(public_port)):
+            raise ValueError('Keskkonnamuutuja PORT peab kattuma avaldamise pordiga')
+        extra.setdefault('PORT', str(public_port))
+        route = {'domain':str(request.get('public_domain') or '').strip().lower(),
+                 'path':str(request.get('public_path') or '').strip().lower(),
+                 'scheme':'http','host':'127.0.0.1','port':public_port,'https_port':443,'certificate':'',
+                 'description':f'PM2 · {username} · {name}','strip_prefix':request.get('strip_prefix') is True,
+                 'websocket':request.get('public_websocket') is True,'enabled':True,
+                 'managed_by':'pm2','owner_user':username,'owner_app':name}
+        route = reverse_proxy({'action':'route_validate','route':route})['route']
+    run_pm2(username, command, extra_env=extra)
+    if route:
+        try:
+            reverse_proxy({'action':'route_save','route':route})
+        except Exception:
+            run_pm2(username, ['delete', name], False)
+            raise
+    audit('app_add', username, name)
+    message=f'Rakendus {name} lisati ja käivitati.'
+    if route: message+=f" Avalik aadress: https://{route['domain']}{route['path']}/"
+    return {'message':message}
+
+
+def startup_unit(account, executable):
+    values = [account.pw_name, account.pw_dir, str(executable)]
+    if any(re.search(r'[\s\n\r]', value) for value in values):
+        raise ValueError('Kasutaja PM2 teed ei sobi systemd teenuse loomiseks')
+    pm2_home = f'{account.pw_dir}/.pm2'
+    path = user_environment(account, executable)['PATH']
+    return f'''[Unit]
+Description=PM2 process manager for {account.pw_name}
+Documentation=https://pm2.keymetrics.io/
+Wants=network-online.target
+After=network.target network-online.target
+
+[Service]
+Type=forking
+User={account.pw_name}
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+Environment=PATH={path}
+Environment=PM2_HOME={pm2_home}
+PIDFile={pm2_home}/pm2.pid
+Restart=on-failure
+ExecStart={executable} resurrect
+ExecReload={executable} reload all
+ExecStop={executable} kill
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+
+def atomic_write(path, content):
+    descriptor, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def enable_startup(username):
+    account = account_for(username)
+    executable = pm2_path(account)
+    if not executable:
+        raise RuntimeError(f'Kasutajale {username} ei ole PM2 paigaldatud')
+    run_pm2(username, ['save', '--force'])
+    unit_path = Path('/etc/systemd/system') / f'pm2-{username}.service'
+    atomic_write(unit_path, startup_unit(account, executable))
+    run(['/usr/bin/systemctl', 'daemon-reload'])
+    run(['/usr/bin/systemctl', 'enable', unit_path.name])
+    audit('startup_enable', username, unit_path.name)
+    return {'message': f'PM2 autostart on kasutajale {username} lubatud.'}
+
+
+def disable_startup(username):
+    unit = f'pm2-{username}.service'
+    run(['/usr/bin/systemctl', 'disable', unit], False)
+    audit('startup_disable', username, unit)
+    return {'message': f'PM2 autostart on kasutajale {username} keelatud. Töötavad protsessid jäid käima.'}
+
+
+def recent_audit(username):
+    if not AUDIT_LOG.is_file():
+        return []
+    result = []
+    for line in AUDIT_LOG.read_text(errors='replace').splitlines()[-100:]:
+        try:
+            item = json.loads(line)
+            if item.get('user') == username:
+                result.append(item)
+        except json.JSONDecodeError:
+            pass
+    return result[-30:]
+
+
+def main(request):
+    action = str(request.get('action') or '')
+    if action in ('status', 'snapshot'):
+        return snapshot(request, action == 'status')
+    username = selected_user(request)
+    if action == 'logs':
+        target = str(process_by_id(username, request.get('id'))['id']) if request.get('id') not in (None, '', 'all') else 'all'
+        result = run_pm2(username, ['logs', target, '--lines', '160', '--nostream', '--raw'], False, 20)
+        return {'log': (result.stdout + result.stderr)[-48000:]}
+    if action == 'activity':
+        return {'items': recent_audit(username)}
+    if action == 'app_add':
+        return add_application(username, request)
+    if action == 'process_action':
+        operation = str(request.get('operation') or '')
+        if operation not in ('start', 'restart', 'reload', 'stop', 'reset'):
+            raise ValueError('Protsessitoiming ei ole lubatud')
+        process = process_by_id(username, request.get('id'))
+        run_pm2(username, [operation, str(process['id'])])
+        audit(f'process_{operation}', username, process['name'])
+        return {'message': f"{process['name']}: toiming „{operation}” lõpetati."}
+    if action == 'process_delete':
+        process = process_by_id(username, request.get('id'))
+        if request.get('confirm') != process['name']:
+            raise ValueError('Kustutamise kinnitus ei ühti rakenduse nimega')
+        run_pm2(username, ['delete', str(process['id'])])
+        route_warning = ''
+        try:
+            managed_routes = [item for item in reverse_proxy_routes()
+                              if item.get('managed_by') == 'pm2' and item.get('owner_user') == username and item.get('owner_app') == process['name']]
+            for route in managed_routes:
+                reverse_proxy({'action': 'route_delete', 'id': route['id']})
+        except Exception as error:
+            route_warning = f' Proxy marsruudi eemaldamine ebaõnnestus: {error}'
+        audit('process_delete', username, process['name'])
+        return {'message': f"Rakendus {process['name']} eemaldati PM2 nimekirjast.{route_warning}"}
+    if action == 'save':
+        run_pm2(username, ['save', '--force'])
+        audit('save', username, 'dump.pm2')
+        return {'message': 'Praegune protsessinimekiri salvestati autostardiks.'}
+    if action == 'resurrect':
+        run_pm2(username, ['resurrect'])
+        audit('resurrect', username, 'dump.pm2')
+        return {'message': 'Salvestatud protsessinimekiri taastati.'}
+    if action == 'startup_enable':
+        return enable_startup(username)
+    if action == 'startup_disable':
+        return disable_startup(username)
+    if action == 'flush_logs':
+        if request.get('confirm') != 'KUSTUTA LOGID':
+            raise ValueError('Logide kustutamise kinnitus ei ühti')
+        run_pm2(username, ['flush'])
+        audit('flush_logs', username, 'all')
+        return {'message': 'Kõigi valitud kasutaja PM2 rakenduste logid tühjendati.'}
+    raise ValueError('Tundmatu toiming')
+
+
+if __name__ == '__main__':
+    try:
+        if os.geteuid() != 0:
+            raise PermissionError('PM2 haldusabiline vajab Cockpiti administraatori õigusi')
+        payload = json.loads(sys.stdin.read() or '{}')
+        print(json.dumps(main(payload), ensure_ascii=False))
+    except Exception as error:
+        print(json.dumps({'error': str(error)}, ensure_ascii=False))
+        sys.exit(1)

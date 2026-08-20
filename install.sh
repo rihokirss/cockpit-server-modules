@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$#" -eq 0 ]; then
-    echo "Usage: $0 certificates|reverseproxy|samba-ad|radius […]" >&2
+    echo "Usage: $0 certificates|reverseproxy|samba-ad|radius|pm2 […]" >&2
     exit 1
 fi
 
@@ -45,6 +45,11 @@ for module in "$@"; do
             install_ui "$source_dir" radius
             install -m 0755 "$source_dir/cockpit-radius-helper" /usr/local/libexec/cockpit-radius-helper
             install -m 0755 "$source_dir/cockpit-radius-ntlm-auth" /usr/local/libexec/cockpit-radius-ntlm-auth
+            ;;
+        pm2)
+            source_dir="$root_dir/cockpit-pm2"
+            install_ui "$source_dir" pm2
+            install -m 0755 "$source_dir/cockpit-pm2-helper" /usr/local/libexec/cockpit-pm2-helper
             ;;
         *)
             echo "Unknown module: $module" >&2

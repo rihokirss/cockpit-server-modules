@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "requires": { "cockpit": "215" },
+  "menu": {
+    "pm2": {
+      "label": "PM2 rakendused",
+      "order": 44,
+      "path": "index.html"
+    }
+  }
+}

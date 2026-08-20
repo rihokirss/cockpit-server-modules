@@ -1,13 +1,14 @@
 # Cockpit Server Modules
 
-Four focused Cockpit extensions for managing a small self-hosted Linux server:
+Five focused Cockpit extensions for managing a small self-hosted Linux server:
 
 | Module | Cockpit menu | Purpose |
 |---|---|---|
 | Certificates | Sertifikaadid | Let's Encrypt lifecycle and Synology DSM deployment |
-| Reverse Proxy | Reverse Proxy | Nginx virtual hosts, HTTPS, health checks and WebSockets |
+| Reverse Proxy | Reverse Proxy | Nginx virtual hosts, shared-domain path routes, HTTPS, health checks and WebSockets |
 | Samba AD DC | Samba Active Directory | Users, groups, computers, DNS, GPOs, backups and diagnostics |
 | RADIUS | RADIUS | FreeRADIUS, UniFi clients and Samba AD authentication |
+| PM2 | PM2 rakendused | Per-user processes, resources, logs, startup persistence and optional proxy publication |
 
 The UI is currently in Estonian. Each package uses Cockpit's privilege escalation
 for a small root-owned helper instead of running the browser-facing code as root.
@@ -19,6 +20,7 @@ for a small root-owned helper instead of running the browser-facing code as root
 - Nginx and Certbot for Reverse Proxy and Certificates;
 - a configured Samba AD DC for Samba AD and RADIUS;
 - FreeRADIUS with `ntlm_auth`/winbind for RADIUS.
+- PM2 installed globally or in a supported per-user NVM/`~/.local` path for PM2.
 
 These modules manage existing services. They do not provision a Samba domain or
 replace the distribution's initial service setup.
@@ -28,7 +30,7 @@ replace the distribution's initial service setup.
 Run the installer as root and select one or more modules:
 
 ```bash
-sudo ./install.sh certificates reverseproxy samba-ad radius
+sudo ./install.sh certificates reverseproxy samba-ad radius pm2
 ```
 
 Then open Cockpit and refresh the page. Packages are installed under
@@ -46,6 +48,7 @@ node --check cockpit-certificates/app.js
 node --check cockpit-reverseproxy/app.js
 node --check cockpit-samba-ad/app.js
 node --check cockpit-radius/app.js
+node --check cockpit-pm2/app.js
 ```
 
 ## Security
