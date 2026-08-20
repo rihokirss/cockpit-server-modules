@@ -1,16 +1,19 @@
 #!/usr/bin/python3
 import datetime, json, os, re, subprocess, sys, tempfile, uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DB = Path('/etc/cockpit-reverseproxy/sites.json')
 ROUTES_DB = Path('/etc/cockpit-reverseproxy/routes.json')
 ROUTE_HOSTS_DB = Path('/etc/cockpit-reverseproxy/route-hosts.json')
 CONF = Path('/etc/nginx/conf.d/cockpit-reverseproxy.conf')
+CATALOG = Path('/var/lib/cockpit-reverseproxy/services.json')
 CERTIFICATES_HELPER = Path('/usr/local/libexec/cockpit-certificates-helper')
 DOMAIN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
 HOST = re.compile(r'^[a-zA-Z0-9_.:-]+$')
 CERT_NAME = re.compile(r'^[A-Za-z0-9_.-]{1,253}$')
 ROUTE_PATH = re.compile(r'^/[a-z0-9][a-z0-9_-]{0,62}$')
+PORTAL_CATEGORIES = {'home','storage','project','tool','service'}
 
 def run(args, check=True):
     p = subprocess.run(args, text=True, capture_output=True)
@@ -47,6 +50,25 @@ def load_route_hosts():
     data=json.loads(ROUTE_HOSTS_DB.read_text())
     return data if isinstance(data,list) else []
 
+def pm2_owner(item, label):
+    owner_user=str(item.get('owner_user','')).strip()
+    owner_app=str(item.get('owner_app','')).strip()
+    managed=item.get('managed_by')=='pm2' or bool(owner_user or owner_app)
+    if not managed: return '','',''
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}',owner_user) or not owner_app or len(owner_app)>100:
+        raise ValueError(f'{label} PM2 omanik ei ole korrektne')
+    return 'pm2',owner_user,owner_app
+
+def portal_fields(item, allow_catalog=False):
+    label=str(item.get('portal_label','')).strip()[:80]
+    description=str(item.get('portal_description','')).strip()[:240]
+    category=str(item.get('portal_category','service')).strip().lower() or 'service'
+    if category not in PORTAL_CATEGORIES: raise ValueError('Portaali kategooria ei ole korrektne')
+    result={'portal_hidden':bool(item.get('portal_hidden',False)),'portal_label':label,
+            'portal_description':description,'portal_category':category}
+    if allow_catalog: result['portal_catalog']=bool(item.get('portal_catalog',False))
+    return result
+
 def validate(s):
     domain=str(s.get('domain','')).lower().strip()
     host=str(s.get('host','')).strip()
@@ -64,7 +86,8 @@ def validate(s):
     if certificate and (not CERT_NAME.fullmatch(certificate) or not has_cert(certificate)): raise ValueError('Valitud sertifikaati ei leitud')
     try: site_id=str(uuid.UUID(str(s.get('id')))) if s.get('id') else str(uuid.uuid4())
     except (ValueError,AttributeError): raise ValueError('Teenuse ID ei ole korrektne')
-    return {'id':site_id,'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True))}
+    managed_by,owner_user,owner_app=pm2_owner(s,'Teenuse')
+    return {'id':site_id,'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True)),'managed_by':managed_by,'owner_user':owner_user,'owner_app':owner_app,**portal_fields(s,True)}
 
 def has_cert(name):
     return bool(name and CERT_NAME.fullmatch(name) and Path('/etc/letsencrypt/live',name,'fullchain.pem').exists())
@@ -135,15 +158,11 @@ def validate_route(route):
     description=str(route.get('description','')).strip()[:160]
     try: route_id=str(uuid.UUID(str(route.get('id')))) if route.get('id') else str(uuid.uuid4())
     except (ValueError,AttributeError): raise ValueError('Marsruudi ID ei ole korrektne')
-    managed_by='pm2' if route.get('managed_by')=='pm2' else ''
-    owner_user=str(route.get('owner_user','')).strip() if managed_by else ''
-    owner_app=str(route.get('owner_app','')).strip() if managed_by else ''
-    if managed_by and (not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}',owner_user) or not owner_app or len(owner_app)>100):
-        raise ValueError('PM2 marsruudi omanik ei ole korrektne')
+    managed_by,owner_user,owner_app=pm2_owner(route,'Marsruudi')
     return {'id':route_id,'domain':domain,'path':path,'scheme':scheme,'host':host,'port':port,
             'https_port':https_port,'certificate':certificate,'websocket':bool(route.get('websocket',True)),
             'strip_prefix':bool(route.get('strip_prefix',True)),'enabled':bool(route.get('enabled',True)),'description':description,
-            'managed_by':managed_by,'owner_user':owner_user,'owner_app':owner_app}
+            'managed_by':managed_by,'owner_user':owner_user,'owner_app':owner_app,**portal_fields(route)}
 
 def validate_route_host(item):
     domain=str(item.get('domain','')).lower().strip()
@@ -163,6 +182,41 @@ def proxy_location(target, websocket=True, indent='        '):
     if websocket:
         lines += [f'{indent}proxy_set_header Upgrade $http_upgrade;',f'{indent}proxy_set_header Connection $connection_upgrade;']
     return lines
+
+def catalog_location(indent='    '):
+    return [f'{indent}location = /api/services {{',f'{indent}    alias {CATALOG};',
+            f'{indent}    default_type application/json;',f'{indent}    add_header Cache-Control "public, max-age=30";',f'{indent}}}']
+
+def public_url(item, item_type):
+    secure=has_cert(item.get('certificate','') or certificate_for_domain(item['domain']))
+    scheme='https' if secure else 'http'
+    port=int(item.get('https_port',443)) if secure else 80
+    authority=item['domain'] if port in (80,443) else f"{item['domain']}:{port}"
+    path=f"{item['path']}/" if item_type=='route' else '/'
+    url=f'{scheme}://{authority}{path}'
+    parsed=urlsplit(url)
+    if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError('Portaali avalik URL ei ole korrektne')
+    return url
+
+def portal_catalog(sites,routes):
+    services=[]
+    for item,item_type in [(item,'site') for item in sites]+[(item,'route') for item in routes]:
+        if not item.get('enabled',True) or item.get('portal_hidden',False): continue
+        category=str(item.get('portal_category','service')).strip().lower() or 'service'
+        if category not in PORTAL_CATEGORIES: continue
+        fallback=item['path'].strip('/').replace('-',' ').replace('_',' ').title() if item_type=='route' else item['domain'].split('.')[0].replace('-',' ').title()
+        services.append({'id':str(item['id']),'label':str(item.get('portal_label','')).strip()[:80] or fallback,
+                         'description':str(item.get('portal_description','')).strip()[:240],
+                         'category':category,'type':item_type,'url':public_url(item,item_type)})
+    services.sort(key=lambda item:(item['category'],item['label'].casefold(),item['id']))
+    return {'updated_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'services':services}
+
+def write_catalog(sites,routes):
+    CATALOG.parent.mkdir(mode=0o755,parents=True,exist_ok=True)
+    with tempfile.NamedTemporaryFile('w',dir=CATALOG.parent,delete=False) as f:
+        json.dump(portal_catalog(sites,routes),f,ensure_ascii=False,indent=2); f.write('\n'); tmp=f.name
+    os.chmod(tmp,0o644); os.replace(tmp,CATALOG)
 
 def route_locations(routes):
     out=[]
@@ -207,7 +261,9 @@ def generate(sites,routes=None,hosts=None):
         out += ['server {','    listen 80;','    listen [::]:80;',f'    server_name {domain};','    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }']
         if plain:
             target=f"{plain['scheme']}://{plain['host']}:{plain['port']}"
-            out += ['    client_max_body_size 0;','    location / {']
+            out += ['    client_max_body_size 0;']
+            if plain.get('portal_catalog',False): out += catalog_location()
+            out += ['    location / {']
             out += proxy_location(target,plain['websocket'])
             out += ['    }','}','']
         elif tls:
@@ -218,7 +274,9 @@ def generate(sites,routes=None,hosts=None):
             out += ['    location / { return 404; }','}','']
         for site in tls:
             target=f"{site['scheme']}://{site['host']}:{site['port']}"; tls_port=int(site.get('https_port',443)); cert_name=site_certificate(site)
-            out += ['server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {domain};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;','    client_max_body_size 0;','    location / {']
+            out += ['server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {domain};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;','    client_max_body_size 0;']
+            if site.get('portal_catalog',False): out += catalog_location()
+            out += ['    location / {']
             out += proxy_location(target,site['websocket'])
             out += ['    }','}','']
     for domain,group in route_groups(routes,sites,hosts).items():
@@ -254,6 +312,7 @@ def persist(sites,routes=None,hosts=None):
     os.chmod(tmp,0o640); os.replace(tmp,ROUTES_DB)
     with tempfile.NamedTemporaryFile('w',dir=ROUTE_HOSTS_DB.parent,delete=False) as f: json.dump(hosts,f,indent=2); f.write('\n'); tmp=f.name
     os.chmod(tmp,0o640); os.replace(tmp,ROUTE_HOSTS_DB)
+    write_catalog(sites,routes)
     run(['/bin/systemctl','reload','nginx'])
     sync_certificate_acme()
 

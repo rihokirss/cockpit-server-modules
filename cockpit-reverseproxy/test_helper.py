@@ -94,6 +94,77 @@ class ReverseProxyHelperTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'juba kasutuses'):
             helper.validate_sites([first, duplicate])
 
+    def test_full_site_pm2_owner_is_validated_and_preserved(self):
+        value = site(443, '127.0.0.1', 8080)
+        value.update({'managed_by': 'pm2', 'owner_user': 'rix', 'owner_app': 'seapro'})
+        validated = helper.validate(value)
+        self.assertEqual(validated['managed_by'], 'pm2')
+        self.assertEqual(validated['owner_user'], 'rix')
+        self.assertEqual(validated['owner_app'], 'seapro')
+
+    def test_partial_full_site_pm2_owner_is_rejected(self):
+        value = site(443, '127.0.0.1', 8080)
+        value.update({'owner_user': 'rix'})
+        with self.assertRaisesRegex(ValueError, 'PM2 omanik'):
+            helper.validate(value)
+
+    def test_portal_entries_are_visible_by_default_and_can_be_hidden(self):
+        visible = site(443, '127.0.0.1', 8080)
+        hidden = site(5001, '192.168.0.252', 5001, 'https')
+        hidden['portal_hidden'] = True
+        disabled = site(8125, '192.168.0.200', 8123)
+        disabled['enabled'] = False
+        result = helper.portal_catalog([visible, hidden, disabled], [])
+        self.assertEqual([entry['id'] for entry in result['services']], [visible['id']])
+
+    def test_portal_catalog_supports_https_ports_and_route_subpaths(self):
+        synology = site(5001, '192.168.0.252', 5001, 'https')
+        synology.update({'portal_label': 'Synology', 'portal_category': 'storage'})
+        route = {
+            'id': str(uuid.uuid4()), 'domain': 'a9-server.kirss.ee', 'path': '/tinkerbox',
+            'certificate': CERTIFICATE, 'https_port': 443, 'enabled': True,
+            'portal_label': 'Tinkerbox', 'portal_category': 'tool',
+        }
+        result = helper.portal_catalog([synology], [route])
+        by_label = {entry['label']: entry for entry in result['services']}
+        self.assertEqual(by_label['Synology']['url'], 'https://a9.kirss.ee:5001/')
+        self.assertEqual(by_label['Tinkerbox']['url'], 'https://a9-server.kirss.ee/tinkerbox/')
+        self.assertEqual(by_label['Tinkerbox']['type'], 'route')
+
+    def test_invalid_portal_category_is_rejected(self):
+        value = site(443, '127.0.0.1', 8080)
+        value['portal_category'] = 'admin'
+        with self.assertRaisesRegex(ValueError, 'kategooria'):
+            helper.validate(value)
+
+    def test_catalog_json_never_contains_internal_proxy_details(self):
+        value = site(443, '10.23.45.67', 49152)
+        value.update({'portal_label': 'SeaPro', 'portal_description': 'Mereprojekt', 'portal_category': 'project'})
+        encoded = json.dumps(helper.portal_catalog([value], []))
+        self.assertNotIn('10.23.45.67', encoded)
+        self.assertNotIn('49152', encoded)
+        self.assertNotIn('/etc/letsencrypt', encoded)
+        self.assertNotIn('certificate', encoded)
+        self.assertEqual(set(helper.portal_catalog([value], [])['services'][0]), {'id','label','description','category','type','url'})
+
+    def test_catalog_file_is_written_atomically_as_public_json(self):
+        value = site(443, '127.0.0.1', 8080)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, 'services.json')
+            with mock.patch.object(helper, 'CATALOG', target):
+                helper.write_catalog([value], [])
+            data = json.loads(target.read_text())
+            self.assertEqual(len(data['services']), 1)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+
+    def test_api_location_is_generated_only_for_catalog_site(self):
+        portal = site(443, '127.0.0.1', 8090)
+        portal['portal_catalog'] = True
+        ordinary = site(5001, '192.168.0.252', 5001, 'https')
+        config = helper.generate([portal, ordinary], [], [])
+        self.assertEqual(config.count('location = /api/services'), 1)
+        self.assertIn(f'alias {helper.CATALOG};', config)
+
     def test_pm2_route_validation_and_generation_remain_supported(self):
         route = {
             'domain': 'a9-server.kirss.ee', 'path': '/tinkerbox', 'scheme': 'http',

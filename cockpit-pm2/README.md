@@ -10,6 +10,8 @@ Cockpit extension for managing PM2 applications across normal Linux user account
 - application creation with working directory, interpreter, arguments, environment,
   cluster mode, watch mode and memory restart limit;
 - optional publication below a shared HTTPS domain path through Cockpit Reverse Proxy;
+- public-link discovery for both PM2-owned path routes and full-domain proxies,
+  with a local listening-port fallback for legacy proxy entries;
 - auto-refreshing, auto-scrolling application logs;
 - PM2 process-list save/restore and per-user systemd startup management;
 - root-only audit log at `/var/log/cockpit-pm2-audit.jsonl`.

@@ -44,6 +44,21 @@
       </div>
       <label>TLS-sertifikaat<select id="certificate"><option value="">Ilma HTTPS-ita</option></select></label>
       <p class="muted form-hint">Sertifikaate väljastatakse ja uuendatakse eraldi Sertifikaatide moodulis.</p>
+      <div class="grid-path">
+        <label>PM2 kasutaja<input id="site-owner-user" placeholder="rix" pattern="[a-z_][a-z0-9_-]{0,31}"></label>
+        <label>PM2 rakenduse nimi<input id="site-owner-app" maxlength="100" placeholder="minu-rakendus"></label>
+      </div>
+      <p class="muted form-hint">Valikuline seos kuvab selle täisdomeeni lingi vastava PM2 protsessi juures. Täida mõlemad väljad või jäta mõlemad tühjaks.</p>
+      <fieldset>
+        <legend>Teenuseportaal</legend>
+        <div class="grid-path">
+          <label>Kuvatav nimi<input id="site-portal-label" maxlength="80" placeholder="Vaikimisi domeeninimi"></label>
+          <label>Kategooria<select id="site-portal-category"><option value="service">Teenus</option><option value="home">Kodu</option><option value="storage">Salvestus</option><option value="project">Projekt</option><option value="tool">Tööriist</option></select></label>
+        </div>
+        <label>Kirjeldus<input id="site-portal-description" maxlength="240" placeholder="Lühike avalik kirjeldus"></label>
+        <label class="check"><input id="site-portal-hidden" type="checkbox"> Peida teenuseportaalist</label>
+        <label class="check"><input id="site-portal-catalog" type="checkbox"> Serveeri selle teenuse kaudu portaali kataloogi</label>
+      </fieldset>
       <label class="check"><input id="websocket" type="checkbox" checked> WebSocketi tugi</label>
       <label class="check"><input id="enabled" type="checkbox" checked> Teenus on aktiivne</label>
       <div class="dialog-actions"><button type="button" id="cancel" class="btn">Loobu</button><button class="btn primary">Salvesta ja rakenda</button></div>
@@ -64,6 +79,15 @@
       </div>
       <label>TLS-sertifikaat<select id="route-certificate"><option value="">Automaatne või HTTP</option></select></label>
       <label>Kirjeldus<input id="route-description" maxlength="160" placeholder="Rakenduse nimi või otstarve"></label>
+      <fieldset>
+        <legend>Teenuseportaal</legend>
+        <div class="grid-path">
+          <label>Kuvatav nimi<input id="route-portal-label" maxlength="80" placeholder="Vaikimisi alamraja nimi"></label>
+          <label>Kategooria<select id="route-portal-category"><option value="service">Teenus</option><option value="home">Kodu</option><option value="storage">Salvestus</option><option value="project">Projekt</option><option value="tool">Tööriist</option></select></label>
+        </div>
+        <label>Avalik kirjeldus<input id="route-portal-description" maxlength="240" placeholder="Lühike avalik kirjeldus"></label>
+        <label class="check"><input id="route-portal-hidden" type="checkbox"> Peida teenuseportaalist</label>
+      </fieldset>
       <label class="check"><input id="route-strip" type="checkbox" checked> Eemalda alamraja prefiks enne rakendusele edastamist</label>
       <p class="muted form-hint">Näiteks /ilm/api suunatakse prefiksi eemaldamisel rakendusele aadressina /api. Saadetakse ka X-Forwarded-Prefix päis.</p>
       <label class="check"><input id="route-websocket" type="checkbox" checked> WebSocketi tugi</label>
