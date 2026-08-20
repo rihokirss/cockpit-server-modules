@@ -19,7 +19,9 @@ SAFE_ENV_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 RESERVED_ENV = {'HOME', 'USER', 'LOGNAME', 'PM2_HOME'}
 SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 REVERSE_PROXY_HELPER = Path('/usr/local/libexec/cockpit-reverseproxy-helper')
+REVERSE_PROXY_SITES = Path('/etc/cockpit-reverseproxy/sites.json')
 REVERSE_PROXY_ROUTES = Path('/etc/cockpit-reverseproxy/routes.json')
+LOCAL_PROXY_HOSTS = {'127.0.0.1', 'localhost', '::1', '0.0.0.0'}
 
 
 def run(args, check=True, timeout=45, env=None):
@@ -112,12 +114,20 @@ def reverse_proxy(payload):
     return response
 
 
-def reverse_proxy_routes():
+def reverse_proxy_items(path):
     try:
-        data = json.loads(REVERSE_PROXY_ROUTES.read_text())
+        data = json.loads(path.read_text())
         return data if isinstance(data, list) else []
     except (FileNotFoundError, json.JSONDecodeError):
         return []
+
+
+def reverse_proxy_sites():
+    return reverse_proxy_items(REVERSE_PROXY_SITES)
+
+
+def reverse_proxy_routes():
+    return reverse_proxy_items(REVERSE_PROXY_ROUTES)
 
 
 def user_can_access(account, path, permission):
@@ -221,6 +231,102 @@ def process_list(username):
     return sorted([process_view(item) for item in pm2_json(username)], key=lambda item: item['id'])
 
 
+def process_port_hints(raw_processes, processes):
+    hints = {item['id']: set() for item in processes}
+    roots = {item['id']: item['pid'] for item in processes if item['pid'] > 0}
+    for raw in raw_processes:
+        process_id = integer(raw.get('pm_id'), -1)
+        port = integer((raw.get('pm2_env') or {}).get('PORT'), -1)
+        if process_id in hints and 1 <= port <= 65535:
+            hints[process_id].add(port)
+
+    children = {}
+    result = run(['/usr/bin/ps', '-e', '-o', 'pid=,ppid='], False)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            try:
+                pid, parent = (int(value) for value in line.split())
+            except (ValueError, TypeError):
+                continue
+            children.setdefault(parent, set()).add(pid)
+    process_trees = {}
+    for process_id, root in roots.items():
+        tree = {root}
+        pending = [root]
+        while pending:
+            descendants = children.get(pending.pop(), set()) - tree
+            tree.update(descendants)
+            pending.extend(descendants)
+        process_trees[process_id] = tree
+
+    result = run(['/usr/bin/ss', '-H', '-ltnp'], False)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            try:
+                port = int(fields[3].rsplit(':', 1)[1])
+            except (ValueError, IndexError):
+                continue
+            owners = {int(value) for value in re.findall(r'pid=(\d+)', line)}
+            for process_id, tree in process_trees.items():
+                if owners & tree:
+                    hints[process_id].add(port)
+    return hints
+
+
+def site_public_url(site):
+    domain = str(site.get('domain') or '')
+    certificate = str(site.get('certificate') or '')
+    if not certificate and (Path('/etc/letsencrypt/live') / domain / 'fullchain.pem').is_file():
+        certificate = domain
+    if not certificate:
+        return f'http://{domain}/'
+    port = integer(site.get('https_port'), 443)
+    suffix = '' if port == 443 else f':{port}'
+    return f'https://{domain}{suffix}/'
+
+
+def route_public_url(route):
+    domain = str(route.get('domain') or '')
+    path = str(route.get('path') or '').rstrip('/')
+    certificate = str(route.get('certificate') or '')
+    if not certificate and (Path('/etc/letsencrypt/live') / domain / 'fullchain.pem').is_file():
+        certificate = domain
+    if not certificate:
+        return f'http://{domain}{path}/'
+    port = integer(route.get('https_port'), 443)
+    suffix = '' if port == 443 else f':{port}'
+    return f'https://{domain}{suffix}{path}/'
+
+
+def process_public_urls(username, processes, raw_processes):
+    links = {item['name']: [] for item in processes}
+
+    def add(name, url):
+        if name in links and url not in links[name]:
+            links[name].append(url)
+
+    sites = [item for item in reverse_proxy_sites() if item.get('enabled', True)]
+    for site in sites:
+        if site.get('managed_by') == 'pm2' and site.get('owner_user') == username:
+            add(str(site.get('owner_app') or ''), site_public_url(site))
+    for route in reverse_proxy_routes():
+        if route.get('enabled', True) and route.get('managed_by') == 'pm2' and route.get('owner_user') == username:
+            add(str(route.get('owner_app') or ''), route_public_url(route))
+
+    port_hints = process_port_hints(raw_processes, processes)
+    for site in sites:
+        if site.get('managed_by') or str(site.get('host') or '').lower() not in LOCAL_PROXY_HOSTS:
+            continue
+        target_port = integer(site.get('port'), -1)
+        matches = {item['name'] for item in processes if target_port in port_hints.get(item['id'], set())}
+        if len(matches) == 1:
+            add(matches.pop(), site_public_url(site))
+    return links
+
+
 def dump_info(account):
     dump = Path(account.pw_dir) / '.pm2/dump.pm2'
     count = 0
@@ -238,12 +344,12 @@ def snapshot(request, include_users=True):
     username = selected_user(request)
     account = account_for(username)
     executable = pm2_path(account)
-    processes = process_list(username)
-    proxy_routes = reverse_proxy_routes()
-    public_urls = {item.get('owner_app'): f"https://{item.get('domain')}{item.get('path')}/" for item in proxy_routes
-                   if item.get('managed_by') == 'pm2' and item.get('owner_user') == username and item.get('enabled', True)}
+    raw_processes = pm2_json(username)
+    processes = sorted([process_view(item) for item in raw_processes], key=lambda item: item['id'])
+    public_urls = process_public_urls(username, processes, raw_processes)
     for process in processes:
-        process['public_url'] = public_urls.get(process['name'], '')
+        process['public_urls'] = public_urls.get(process['name'], [])
+        process['public_url'] = process['public_urls'][0] if process['public_urls'] else ''
     online = sum(1 for item in processes if item['status'] == 'online')
     memory = sum(item['memory'] for item in processes)
     cpu = sum(item['cpu'] for item in processes)
@@ -492,6 +598,10 @@ def main(request):
                               if item.get('managed_by') == 'pm2' and item.get('owner_user') == username and item.get('owner_app') == process['name']]
             for route in managed_routes:
                 reverse_proxy({'action': 'route_delete', 'id': route['id']})
+            managed_sites = [item for item in reverse_proxy_sites()
+                             if item.get('managed_by') == 'pm2' and item.get('owner_user') == username and item.get('owner_app') == process['name']]
+            for site in managed_sites:
+                reverse_proxy({'action': 'delete', 'id': site['id']})
         except Exception as error:
             route_warning = f' Proxy marsruudi eemaldamine ebaõnnestus: {error}'
         audit('process_delete', username, process['name'])
