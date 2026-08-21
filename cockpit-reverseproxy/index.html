@@ -79,7 +79,7 @@
     <form id="route-form">
       <h2 id="route-title">Lisa alamrada</h2><input type="hidden" id="route-original-id"><input type="hidden" id="route-id">
       <div class="grid-path">
-        <label>Domeeninimi<input id="route-domain" required placeholder="server.example.ee" pattern="[A-Za-z0-9.-]+"></label>
+        <label>Domeeninimi<input id="route-domain" list="route-domain-list" required placeholder="server.example.ee" pattern="[A-Za-z0-9.-]+"><datalist id="route-domain-list"></datalist></label>
         <label>Alamrada<input id="route-path" required placeholder="/rakendus" pattern="/[a-z0-9][a-z0-9_-]*"></label>
       </div>
       <div class="grid4">

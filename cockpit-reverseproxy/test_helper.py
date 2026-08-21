@@ -206,5 +206,112 @@ class ReverseProxyHelperTests(unittest.TestCase):
         self.assertIn('proxy_pass http://127.0.0.1:3000;', config)
 
 
+def site_route(path='/labs', port=8095, https_port=443, certificate=CERTIFICATE):
+    return {
+        'id': str(uuid.uuid4()), 'domain': 'a9.kirss.ee', 'path': path, 'scheme': 'http',
+        'host': '127.0.0.1', 'port': port, 'https_port': https_port,
+        'certificate': certificate, 'description': '', 'strip_prefix': False,
+        'websocket': False, 'enabled': True,
+    }
+
+
+class SiteDomainRouteTests(unittest.TestCase):
+    """Sub-path routes riding on a full-domain service (e.g. a9.kirss.ee/labs)."""
+
+    def setUp(self):
+        self.cert_patch = mock.patch.object(helper, 'has_cert', side_effect=lambda name: name == CERTIFICATE)
+        self.cert_patch.start()
+        self.addCleanup(self.cert_patch.stop)
+
+    def test_route_on_site_domain_is_injected_into_tls_block(self):
+        config = helper.generate([site(443, '127.0.0.1', 8090)], [site_route()], [])
+        self.assertIn('location = /labs { return 308 /labs/$is_args$args; }', config)
+        self.assertIn('location ^~ /labs/ {', config)
+        self.assertIn('proxy_pass http://127.0.0.1:8095;', config)
+        # No third standalone server block for the same domain.
+        self.assertEqual(config.count('server_name a9.kirss.ee;'), 2)
+        self.assertNotIn('location / { return 404; }', config)
+
+    def test_route_locations_precede_site_root_location(self):
+        config = helper.generate([site(443, '127.0.0.1', 8090)], [site_route()], [])
+        tls_block = config[config.index('listen 443 ssl'):]
+        self.assertLess(tls_block.index('location ^~ /labs/'), tls_block.index('    location / {'))
+
+    def test_route_on_plain_http_site_domain(self):
+        plain = site(443, '127.0.0.1', 8090)
+        plain['certificate'] = ''
+        route = site_route(certificate='')
+        with mock.patch.object(helper, 'certificate_for_domain', return_value=''), \
+             mock.patch.object(helper, 'has_cert', return_value=False):
+            config = helper.generate([plain], [route], [])
+        http_block = config[config.index('listen 80'):]
+        self.assertIn('location ^~ /labs/', http_block)
+
+    def test_route_port_or_cert_mismatch_with_site_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'ühtima täisdomeeni'):
+            helper.route_groups([site_route(https_port=5001)], [site(443, '127.0.0.1', 8090)], [])
+
+    def test_route_host_on_site_domain_still_rejected(self):
+        hosts = [{'domain': 'a9.kirss.ee', 'https_port': 443, 'certificate': CERTIFICATE, 'enabled': True}]
+        with self.assertRaisesRegex(ValueError, 'täisdomeeni proxy kasutuses'):
+            helper.route_groups([], [site(443, '127.0.0.1', 8090)], hosts)
+
+    def test_route_save_on_site_domain_skips_route_host(self):
+        captured = {}
+
+        def persist(sites, routes=None, hosts=None):
+            captured['routes'] = routes
+            captured['hosts'] = hosts
+
+        request = {'action': 'route_save', 'route': site_route()}
+        with mock.patch.object(helper, 'load', return_value=[site(443, '127.0.0.1', 8090)]), \
+             mock.patch.object(helper, 'load_routes', return_value=[]), \
+             mock.patch.object(helper, 'load_route_hosts', return_value=[]), \
+             mock.patch.object(helper, 'cert_domains', return_value=['a9.kirss.ee']), \
+             mock.patch.object(helper, 'persist', side_effect=persist):
+            result = helper.main(request)
+        self.assertTrue(result['ok'])
+        self.assertEqual(captured['hosts'], [])
+        self.assertEqual(len(captured['routes']), 1)
+
+    def test_route_save_on_site_domain_inherits_certificate(self):
+        request = {'action': 'route_validate', 'route': site_route(certificate='')}
+        with mock.patch.object(helper, 'load', return_value=[site(443, '127.0.0.1', 8090)]), \
+             mock.patch.object(helper, 'load_routes', return_value=[]), \
+             mock.patch.object(helper, 'load_route_hosts', return_value=[]), \
+             mock.patch.object(helper, 'certificate_for_domain', return_value=''), \
+             mock.patch.object(helper, 'cert_domains', return_value=['a9.kirss.ee']):
+            result = helper.main(request)
+        self.assertEqual(result['route']['certificate'], CERTIFICATE)
+
+    def test_portal_catalog_url_for_route_on_site_domain(self):
+        route = site_route()
+        route.update({'portal_label': 'ITK Labs', 'portal_category': 'project'})
+        result = helper.portal_catalog([], [route])
+        self.assertEqual(result['services'][0]['url'], 'https://a9.kirss.ee/labs/')
+        self.assertEqual(result['services'][0]['type'], 'route')
+
+    def test_catalog_location_coexists_with_site_domain_routes(self):
+        portal = site(443, '127.0.0.1', 8090)
+        portal['portal_catalog'] = True
+        config = helper.generate([portal], [site_route()], [])
+        self.assertEqual(config.count('location = /api/services'), 1)
+        self.assertIn('location ^~ /labs/', config)
+
+    def test_multiple_tls_ports_inject_route_only_into_matching_block(self):
+        sites = [site(443, '127.0.0.1', 8090), site(5001, '192.168.0.252', 5001, 'https')]
+        config = helper.generate(sites, [site_route()], [])
+        self.assertEqual(config.count('location ^~ /labs/'), 1)
+        self.assertLess(config.index('listen 443 ssl'), config.index('location ^~ /labs/'))
+        self.assertLess(config.index('location ^~ /labs/'), config.index('listen 5001 ssl'))
+
+    def test_disabled_site_makes_route_standalone_again(self):
+        disabled = site(443, '127.0.0.1', 8090)
+        disabled['enabled'] = False
+        config = helper.generate([disabled], [site_route()], [])
+        self.assertIn('location ^~ /labs/', config)
+        self.assertIn('location / { return 404; }', config)
+
+
 if __name__ == '__main__':
     unittest.main()

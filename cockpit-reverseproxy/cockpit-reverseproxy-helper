@@ -259,16 +259,18 @@ def route_locations(routes):
 def route_groups(routes,sites,hosts=None):
     hosts=load_route_hosts() if hosts is None else hosts
     site_domains={site['domain'] for site in sites}
+    enabled_sites=[site for site in sites if site.get('enabled',True)]
+    enabled_site_domains={site['domain'] for site in enabled_sites}
     groups={}
     for host in hosts:
         if not host['enabled']: continue
         if host['domain'] in site_domains: raise ValueError(f"Domeen {host['domain']} on juba täisdomeeni proxy kasutuses")
-        groups[host['domain']]={'routes':[],'certificate':host['certificate'] or certificate_for_domain(host['domain']),'https_port':host['https_port']}
+        groups[host['domain']]={'routes':[],'certificate':host['certificate'] or certificate_for_domain(host['domain']),'https_port':host['https_port'],'site_domain':False}
     for route in routes:
         if not route['enabled']: continue
-        if route['domain'] in site_domains: raise ValueError(f"Domeen {route['domain']} on juba täisdomeeni proxy kasutuses")
         route_certificate=route['certificate'] or certificate_for_domain(route['domain'])
-        group=groups.setdefault(route['domain'],{'routes':[],'certificate':route_certificate,'https_port':route['https_port']})
+        group=groups.setdefault(route['domain'],{'routes':[],'certificate':route_certificate,'https_port':route['https_port'],
+                                                'site_domain':route['domain'] in enabled_site_domains})
         if group['certificate']!=route_certificate or group['https_port']!=route['https_port']:
             raise ValueError(f'Domeeni {route["domain"]} marsruutidel peavad olema sama HTTPS port ja sertifikaat')
         group['routes'].append(route)
@@ -276,19 +278,34 @@ def route_groups(routes,sites,hosts=None):
         items=group['routes']
         paths=[item['path'] for item in items]
         if len(paths)!=len(set(paths)): raise ValueError(f'Domeenil {domain} on korduv alamrada')
+        if group.get('site_domain'):
+            # A sub-path on a full-domain service must ride on that service's
+            # endpoint: same certificate and HTTPS port, or plain HTTP site.
+            matches=[site for site in enabled_sites if site['domain']==domain]
+            if has_cert(group['certificate']):
+                if not any(has_cert(site_certificate(site)) and site_certificate(site)==group['certificate']
+                           and int(site.get('https_port',443))==int(group['https_port']) for site in matches):
+                    raise ValueError(f'Domeeni {domain} alamraja sertifikaat ja HTTPS port peavad ühtima täisdomeeni teenusega')
+            elif not any(not has_cert(site_certificate(site)) for site in matches):
+                raise ValueError(f'Domeenil {domain} puudub HTTP täisdomeeni teenus alamraja jaoks')
     return groups
 
 def generate(sites,routes=None,hosts=None):
     routes=load_routes() if routes is None else routes
+    groups=route_groups(routes,sites,hosts)
+    site_route_groups={domain:group for domain,group in groups.items() if group.get('site_domain')}
+    standalone={domain:group for domain,group in groups.items() if not group.get('site_domain')}
     out=['# Managed by Cockpit Reverse Proxy. Do not edit manually.','map $http_upgrade $connection_upgrade {','    default upgrade;','    \'\' close;','}','']
     for domain,items in site_groups(sites).items():
         plain=next((site for site in items if not has_cert(site_certificate(site))),None)
         tls=sorted((site for site in items if has_cert(site_certificate(site))),key=lambda site:(int(site.get('https_port',443))!=443,int(site.get('https_port',443))))
+        extra=site_route_groups.get(domain)
         out += ['server {','    listen 80;','    listen [::]:80;',f'    server_name {domain};','    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }']
         if plain:
             target=f"{plain['scheme']}://{plain['host']}:{plain['port']}"
             out += ['    client_max_body_size 0;']
             if plain.get('portal_catalog',False): out += catalog_location()
+            if extra and not has_cert(extra['certificate']): out += route_locations(extra['routes'])
             out += ['    location / {']
             out += proxy_location(target,plain['websocket'],options=plain)
             out += ['    }','}','']
@@ -302,10 +319,15 @@ def generate(sites,routes=None,hosts=None):
             target=f"{site['scheme']}://{site['host']}:{site['port']}"; tls_port=int(site.get('https_port',443)); cert_name=site_certificate(site)
             out += ['server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {domain};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;','    client_max_body_size 0;']
             if site.get('portal_catalog',False): out += catalog_location()
+            # Sub-path routes riding on this full-domain service (same
+            # certificate + HTTPS port) live inside its server block, ahead of
+            # the catch-all location /.
+            if extra and has_cert(extra['certificate']) and int(site.get('https_port',443))==int(extra['https_port']):
+                out += route_locations(extra['routes'])
             out += ['    location / {']
             out += proxy_location(target,site['websocket'],options=site)
             out += ['    }','}','']
-    for domain,group in route_groups(routes,sites,hosts).items():
+    for domain,group in standalone.items():
         items=group['routes']; tls_port=group['https_port']; cert_name=group['certificate']
         out += ['server {','    listen 80;','    listen [::]:80;',f'    server_name {domain};','    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }']
         if has_cert(cert_name):
@@ -371,11 +393,23 @@ def main(req):
         persist([item for item in sites if item.get('id')!=site_id]); return {'ok':True}
     if action in ('route_validate','route_save'):
         route=validate_route(req.get('route',{})); original_id=str(req.get('original_id') or route['id'])
+        site_domains={item['domain'] for item in sites}
+        if route['domain'] in site_domains:
+            # A sub-path on a full-domain service: no shared route-host entry
+            # (the site already carries the certificate + port), and an empty
+            # certificate inherits the matching TLS site's one.
+            if not str((req.get('route') or {}).get('certificate','')).strip():
+                tls_site=next((item for item in sites if item['domain']==route['domain']
+                               and int(item.get('https_port',443))==route['https_port']
+                               and has_cert(site_certificate(item))),None)
+                if tls_site: route['certificate']=site_certificate(tls_site)
+            candidate_hosts=route_hosts
+        else:
+            host=validate_route_host({'domain':route['domain'],'https_port':route['https_port'],'certificate':route['certificate'],'enabled':True})
+            candidate_hosts=[host if item.get('domain')==host['domain'] else item for item in route_hosts]
+            if not any(item.get('domain')==host['domain'] for item in route_hosts): candidate_hosts.append(host)
         candidate=[route if item.get('id')==original_id else item for item in routes]
         if not any(item.get('id')==original_id for item in routes): candidate.append(route)
-        host=validate_route_host({'domain':route['domain'],'https_port':route['https_port'],'certificate':route['certificate'],'enabled':True})
-        candidate_hosts=[host if item.get('domain')==host['domain'] else item for item in route_hosts]
-        if not any(item.get('domain')==host['domain'] for item in route_hosts): candidate_hosts.append(host)
         route_groups(candidate,sites,candidate_hosts)
         if action=='route_save': persist(sites,candidate,candidate_hosts)
         return {'ok':True,'route':route}

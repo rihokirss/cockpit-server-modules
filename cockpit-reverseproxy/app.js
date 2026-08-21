@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 let sites = [];
 let routes = [];
 let certificates = [];
+let routeHosts = [];
 
 async function api(action, payload = {}) {
   const process = cockpit.spawn(['/usr/local/libexec/cockpit-reverseproxy-helper'], { superuser: 'require', err: 'message' });
@@ -47,7 +48,7 @@ function render() {
 }
 async function refresh() {
   try {
-    const result = await api('list'); sites = result.sites || []; routes = result.routes || []; certificates = result.certificates || []; render();
+    const result = await api('list'); sites = result.sites || []; routes = result.routes || []; certificates = result.certificates || []; routeHosts = result.route_hosts || []; render();
     $('status').textContent = result.active ? 'Nginx töötab' : 'Nginx ei tööta';
     $('status').className = 'badge ' + (result.active ? 'ok' : 'bad');
   } catch (error) { notice(error.message, true); $('status').textContent='Viga'; $('status').className='badge bad'; }
@@ -69,6 +70,9 @@ function openRouteEditor(id='') {
   $('route-title').textContent=id ? 'Muuda alamrada' : 'Lisa alamrada'; $('route-original-id').value=id; $('route-id').value=route.id || '';
   $('route-domain').value=route.domain; $('route-path').value=route.path; $('route-scheme').value=route.scheme; $('route-host').value=route.host; $('route-port').value=route.port; $('route-https-port').value=route.https_port || 443; $('route-description').value=route.description || '';
   $('route-certificate').innerHTML='<option value="">Automaatne või HTTP</option>' + certificates.map(cert => `<option value="${esc(cert.name)}">${esc(cert.name)} · ${esc((cert.domains||[]).join(', '))}</option>`).join('');
+  const domainOptions=[...new Set([...sites.map(item=>item.domain), ...routeHosts.map(item=>item.domain)])];
+  $('route-domain-list').innerHTML=domainOptions.map(domain=>`<option value="${esc(domain)}"></option>`).join('');
+  $('route-domain').onchange=()=>{const match=sites.find(item=>item.domain===$('route-domain').value.trim().toLowerCase()&&item.https);if(match)$('route-https-port').value=match.https_port||443;};
   $('route-certificate').value=route.certificate || ''; $('route-portal-label').value=route.portal_label || ''; $('route-portal-description').value=route.portal_description || ''; $('route-portal-category').value=route.portal_category || 'service'; $('route-portal-hidden').checked=Boolean(route.portal_hidden); $('route-strip').checked=route.strip_prefix; $('route-websocket').checked=route.websocket; $('route-enabled').checked=route.enabled; $('route-editor').showModal();
 }
 async function removeSite(id) { const site=sites.find(item=>item.id===id); if (!site || !confirm(`Kustutada ${site.domain}:${site.https_port || 443}?`)) return; try { await api('delete',{id}); notice('Teenus kustutatud.'); await refresh(); } catch(error) { notice(error.message,true); } }
