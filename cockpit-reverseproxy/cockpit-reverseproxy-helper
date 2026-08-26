@@ -87,7 +87,7 @@ def validate(s):
     try: site_id=str(uuid.UUID(str(s.get('id')))) if s.get('id') else str(uuid.uuid4())
     except (ValueError,AttributeError): raise ValueError('Teenuse ID ei ole korrektne')
     managed_by,owner_user,owner_app=pm2_owner(s,'Teenuse')
-    return {'id':site_id,'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True)),'managed_by':managed_by,'owner_user':owner_user,'owner_app':owner_app,**portal_fields(s,True),**proxy_options(s)}
+    return {'id':site_id,'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'dsm_passthrough':bool(s.get('dsm_passthrough',False)),'enabled':bool(s.get('enabled',True)),'managed_by':managed_by,'owner_user':owner_user,'owner_app':owner_app,**portal_fields(s,True),**proxy_options(s)}
 
 def proxy_options(site):
     result={}
@@ -135,7 +135,7 @@ def site_certificate(site):
     return site.get('certificate') or (domain if has_cert(domain) else '')
 
 def validate_sites(sites):
-    ids=set(); endpoints=set(); plain_domains=set()
+    ids=set(); endpoints=set(); plain_domains=set(); dsm_domains=set()
     for site in sites:
         try: site_id=str(uuid.UUID(str(site.get('id'))))
         except (ValueError,AttributeError,TypeError): raise ValueError('Teenuse ID ei ole korrektne')
@@ -144,9 +144,16 @@ def validate_sites(sites):
         endpoint=(site['domain'],int(site.get('https_port',443)))
         if endpoint in endpoints: raise ValueError(f'Domeenil {site["domain"]} on HTTPS port {endpoint[1]} juba kasutuses')
         endpoints.add(endpoint)
+        if site.get('enabled',True) and site.get('dsm_passthrough',False):
+            if site['domain'] in dsm_domains: raise ValueError(f'Domeenil {site["domain"]} saab olla ainult üks Synology DSM-i veebiteede siht')
+            dsm_domains.add(site['domain'])
         if not has_cert(site_certificate(site)):
             if site['domain'] in plain_domains: raise ValueError(f'Domeenil {site["domain"]} saab olla ainult üks HTTP teenus')
             plain_domains.add(site['domain'])
+    for domain in dsm_domains:
+        if not any(site.get('enabled',True) and site['domain']==domain and int(site.get('https_port',443))==443
+                   and has_cert(site_certificate(site)) for site in sites):
+            raise ValueError(f'Domeenil {domain} puudub HTTPS port 443, mille kaudu DSM-i veebiteid jagada')
 
 def site_groups(sites):
     validate_sites(sites)
@@ -208,6 +215,30 @@ def proxy_location(target, websocket=True, indent='        ', options=None):
     lines += [f'{indent}proxy_connect_timeout {options["connect_timeout"]}s;',
               f'{indent}proxy_read_timeout {options["read_timeout"]}s;',f'{indent}proxy_send_timeout {options["send_timeout"]}s;',f'{indent}proxy_buffering off;']
     return lines
+
+def dsm_locations(site):
+    """Expose DSM web UI paths on the domain's standard HTTPS endpoint.
+
+    DSM and packages such as Surveillance Station use root-relative resources,
+    API calls and WebSockets even when their launch URL starts below /webman.
+    Keeping these locations together avoids a fragile list of user-managed
+    sub-path routes and leaves the domain's normal catch-all service intact.
+    """
+    target=f"{site['scheme']}://{site['host']}:{site['port']}"
+    exact_paths=('/index.cgi','/favicon.ico')
+    prefix_paths=('/webman','/webapi','/scripts','/synoSDSjslib')
+    out=[]
+    for path in exact_paths:
+        out += [f'    location = {path} {{']
+        out += proxy_location(target,site.get('websocket',True))
+        out += ['    }']
+    for path in prefix_paths:
+        out += [f'    location = {path} {{']
+        out += proxy_location(target,site.get('websocket',True))
+        out += ['    }',f'    location ^~ {path}/ {{']
+        out += proxy_location(target,site.get('websocket',True))
+        out += ['    }']
+    return out
 
 def catalog_location(indent='    '):
     return [f'{indent}location = /api/services {{',f'{indent}    alias {CATALOG};',
@@ -315,6 +346,7 @@ def generate(sites,routes=None,hosts=None):
             out += [f'    location / {{ return 301 {redirect}; }}','}','']
         else:
             out += ['    location / { return 404; }','}','']
+        dsm_site=next((site for site in items if site.get('dsm_passthrough',False)),None)
         for site in tls:
             target=f"{site['scheme']}://{site['host']}:{site['port']}"; tls_port=int(site.get('https_port',443)); cert_name=site_certificate(site)
             out += ['server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {domain};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;','    client_max_body_size 0;']
@@ -324,6 +356,8 @@ def generate(sites,routes=None,hosts=None):
             # the catch-all location /.
             if extra and has_cert(extra['certificate']) and int(site.get('https_port',443))==int(extra['https_port']):
                 out += route_locations(extra['routes'])
+            if dsm_site and tls_port==443:
+                out += dsm_locations(dsm_site)
             out += ['    location / {']
             out += proxy_location(target,site['websocket'],options=site)
             out += ['    }','}','']

@@ -185,6 +185,34 @@ class ReverseProxyHelperTests(unittest.TestCase):
         self.assertEqual(config.count('location = /api/services'), 1)
         self.assertIn(f'alias {helper.CATALOG};', config)
 
+    def test_dsm_web_paths_are_exposed_on_standard_https_port(self):
+        portal = site(443, '127.0.0.1', 8090)
+        synology = site(5001, '192.168.0.252', 5001, 'https')
+        synology['dsm_passthrough'] = True
+        config = helper.generate([portal, synology], [], [])
+        port_443 = config[config.index('listen 443 ssl'):config.index('listen 5001 ssl')]
+        self.assertIn('location = /index.cgi {', port_443)
+        self.assertIn('location ^~ /webman/ {', port_443)
+        self.assertIn('location ^~ /webapi/ {', port_443)
+        self.assertIn('location ^~ /scripts/ {', port_443)
+        self.assertIn('location ^~ /synoSDSjslib/ {', port_443)
+        self.assertIn('proxy_pass https://192.168.0.252:5001;', port_443)
+        self.assertNotIn('location ^~ /webman/ {', config[config.index('listen 5001 ssl'):])
+
+    def test_dsm_passthrough_requires_standard_https_site(self):
+        synology = site(5001, '192.168.0.252', 5001, 'https')
+        synology['dsm_passthrough'] = True
+        with self.assertRaisesRegex(ValueError, 'HTTPS port 443'):
+            helper.validate_sites([synology])
+
+    def test_only_one_dsm_passthrough_target_is_allowed_per_domain(self):
+        portal = site(443, '127.0.0.1', 8090)
+        first = site(5001, '192.168.0.252', 5001, 'https')
+        second = site(5002, '192.168.0.253', 5001, 'https')
+        first['dsm_passthrough'] = second['dsm_passthrough'] = True
+        with self.assertRaisesRegex(ValueError, 'ainult üks'):
+            helper.validate_sites([portal, first, second])
+
     def test_pm2_route_validation_and_generation_remain_supported(self):
         route = {
             'domain': 'a9-server.kirss.ee', 'path': '/tinkerbox', 'scheme': 'http',

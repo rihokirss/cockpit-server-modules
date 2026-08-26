@@ -25,7 +25,7 @@ function esc(value) { const node=document.createElement('div'); node.textContent
 function render() {
   $('empty').classList.toggle('hidden', sites.length > 0);
   $('sites').innerHTML = sites.map(site => `<tr>
-    <td><strong>${esc(site.domain)}</strong>${site.enabled ? '' : ' <span class="pill">väljas</span>'}${site.portal_hidden?' <span class="pill">portaalist peidetud</span>':''}${site.portal_catalog?' <span class="pill yes">kataloog</span>':''}${site.managed_by==='pm2'?`<small class="route-url">PM2 · ${esc(site.owner_user)} · ${esc(site.owner_app)}</small>`:''}</td>
+    <td><strong>${esc(site.domain)}</strong>${site.enabled ? '' : ' <span class="pill">väljas</span>'}${site.portal_hidden?' <span class="pill">portaalist peidetud</span>':''}${site.portal_catalog?' <span class="pill yes">kataloog</span>':''}${site.dsm_passthrough?' <span class="pill yes">DSM → 443</span>':''}${site.managed_by==='pm2'?`<small class="route-url">PM2 · ${esc(site.owner_user)} · ${esc(site.owner_app)}</small>`:''}</td>
     <td>${esc(site.scheme)}://${esc(site.host)}:${site.port}</td>
     <td>${site.https ? `<span class="pill yes" title="Kehtib kuni ${esc(site.cert_expiry || '')}">port ${site.https_port || 443}</span><small class="cert-name">${esc(site.certificate)}</small>` : '<span class="pill">HTTP</span>'}</td>
     <td>${site.websocket ? '<span class="pill yes">jah</span>' : 'ei'}</td>
@@ -55,7 +55,7 @@ async function refresh() {
 }
 async function refreshLogs() { try { $('logs').textContent=(await api('logs')).logs || 'Logi on tühi.'; } catch (error) { $('logs').textContent=error.message; } }
 function openEditor(id='') {
-  const site=sites.find(item => item.id === id) || {id:'',scheme:'http',host:'',port:80,https_port:443,certificate:'',owner_user:'',owner_app:'',portal_label:'',portal_description:'',portal_category:'service',portal_hidden:false,portal_catalog:false,websocket:true,enabled:true};
+  const site=sites.find(item => item.id === id) || {id:'',scheme:'http',host:'',port:80,https_port:443,certificate:'',owner_user:'',owner_app:'',portal_label:'',portal_description:'',portal_category:'service',portal_hidden:false,portal_catalog:false,websocket:true,dsm_passthrough:false,enabled:true};
   $('form-title').textContent=id ? 'Muuda teenust' : 'Lisa teenus'; $('site-id').value=site.id || '';
   ['domain','scheme','host','port'].forEach(key => $(key).value=site[key] || ''); $('https-port').value=site.https_port || 443;
   $('certificate').innerHTML='<option value="">Ilma HTTPS-ita</option>' + certificates.map(cert => `<option value="${esc(cert.name)}">${esc(cert.name)}</option>`).join('');
@@ -63,6 +63,7 @@ function openEditor(id='') {
   for(const [key,fallback] of [['connect_timeout',60],['read_timeout',3600],['send_timeout',3600]])$(key.replace('_','-')).value=site[key]??fallback;
   $('proxy-headers').value=Object.entries(site.headers||{}).map(([key,value])=>`${key}: ${value}`).join('\n');$('proxy-advanced').open=false;
   $('site-owner-user').value=site.owner_user || ''; $('site-owner-app').value=site.owner_app || ''; $('site-portal-label').value=site.portal_label || ''; $('site-portal-description').value=site.portal_description || ''; $('site-portal-category').value=site.portal_category || 'service'; $('site-portal-hidden').checked=Boolean(site.portal_hidden); $('site-portal-catalog').checked=Boolean(site.portal_catalog);
+  $('dsm-passthrough').checked=Boolean(site.dsm_passthrough);
   $('editor').showModal();
 }
 function openRouteEditor(id='') {
@@ -83,7 +84,7 @@ async function routeHealth(id) { const route=routes.find(item=>item.id===id); tr
 $('site-form').onsubmit=async event => {
   event.preventDefault();
   const ownerUser=$('site-owner-user').value.trim(); const ownerApp=$('site-owner-app').value.trim();
-  const site={id:$('site-id').value,domain:$('domain').value.trim().toLowerCase(),scheme:$('scheme').value,host:$('host').value.trim(),port:Number($('port').value),https_port:Number($('https-port').value),certificate:$('certificate').value,managed_by:ownerUser||ownerApp?'pm2':'',owner_user:ownerUser,owner_app:ownerApp,portal_label:$('site-portal-label').value.trim(),portal_description:$('site-portal-description').value.trim(),portal_category:$('site-portal-category').value,portal_hidden:$('site-portal-hidden').checked,portal_catalog:$('site-portal-catalog').checked,websocket:$('websocket').checked,enabled:$('enabled').checked};
+  const site={id:$('site-id').value,domain:$('domain').value.trim().toLowerCase(),scheme:$('scheme').value,host:$('host').value.trim(),port:Number($('port').value),https_port:Number($('https-port').value),certificate:$('certificate').value,managed_by:ownerUser||ownerApp?'pm2':'',owner_user:ownerUser,owner_app:ownerApp,portal_label:$('site-portal-label').value.trim(),portal_description:$('site-portal-description').value.trim(),portal_category:$('site-portal-category').value,portal_hidden:$('site-portal-hidden').checked,portal_catalog:$('site-portal-catalog').checked,websocket:$('websocket').checked,dsm_passthrough:$('dsm-passthrough').checked,enabled:$('enabled').checked};
   try {
     site.headers={};
     for(const line of $('proxy-headers').value.split('\n').filter(line=>line.trim())){

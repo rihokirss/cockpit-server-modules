@@ -31,6 +31,11 @@ saab valida prefiksi eemaldamise, WebSocketi toe ning eraldi upstream-pordi.
 Prefiksi eemaldamisel saadetakse rakendusele `X-Forwarded-Prefix` ja
 `X-Original-URI` päised ning kohandatakse küpsiste teed ja upstream-suunamised.
 
+Synology DSM-i teenusel saab sisse lülitada DSM-i veebiteede jagamise sama
+domeeni standardsel HTTPS-pordil 443. Moodul suunab siis DSM-i kasutajaliidese,
+API, WebSocketi ja Surveillance Stationi jaoks vajalikud juurteed NAS-i, kuid
+jätab domeeni ülejäänud teed selle tavapärase täisdomeeni teenuse hallata.
+
 ## Teenuseportaal
 
 Aktiivsed teenused ja alamrajad lisatakse vaikimisi avalikku kataloogi. Kirje
