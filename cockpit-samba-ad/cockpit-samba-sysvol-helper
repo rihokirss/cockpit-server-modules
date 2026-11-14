@@ -243,9 +243,10 @@ def status_local(config):
 
 def sync_health(last_sync, max_age=900):
     try:
+        timestamp = last_sync.get('last_success') if last_sync.get('running') else last_sync.get('finished_at')
         age = (datetime.datetime.now(datetime.timezone.utc) -
-               datetime.datetime.fromisoformat(last_sync['finished_at'])).total_seconds()
-        return last_sync.get('ok') is True and 0 <= age <= max_age
+               datetime.datetime.fromisoformat(timestamp)).total_seconds()
+        return (last_sync.get('ok') is True or last_sync.get('running') is True) and 0 <= age <= max_age
     except (KeyError, TypeError, ValueError):
         return False
 
@@ -262,11 +263,29 @@ def status(config):
     except Exception as exc:
         error = str(exc)
     coordinator = local if config['role'] == 'coordinator' else peer
-    healthy = bool(not error and coordinator and peer and local['acl']['ok'] and
-                   peer['acl']['ok'] and sync_health(coordinator['last_sync']))
-    return {'configured': True, 'healthy': healthy, 'local': local, 'peer': peer,
+    issues = [error] if error else []
+    last = (coordinator or {}).get('last_sync', {})
+    running = bool(coordinator and coordinator.get('service', {}).get('ActiveState') == 'activating')
+    if coordinator:
+        if not coordinator.get('automatic'):
+            issues.append('Koordinaatori automaatne SYSVOL sünkroonimine on välja lülitatud või timer ei tööta.')
+        follower = peer if config['role'] == 'coordinator' else local
+        timer = (follower or {}).get('timer', {})
+        if timer.get('ActiveState') == 'active' or timer.get('UnitFileState') == 'enabled':
+            issues.append('Partneri timer peab olema välja lülitatud; timer töötab ainult koordinaatoris.')
+        # A running marker left by a killed process must never mask a failed run.
+        effective = dict(last, running=running and last.get('running', False))
+        if not sync_health(effective):
+            issues.append(last.get('error') or 'Värske edukas SYSVOL sünkroonimine puudub (piir 15 minutit).')
+        if last.get('running') and not running:
+            issues.append('Viimase sünkroonimise protsess katkes enne tulemuse salvestamist.')
+    for node in (local, peer):
+        if node and not node.get('acl', {}).get('ok'):
+            issues.append(f"{node.get('hostname', 'DC')}: SYSVOL õigused ei vasta AD-le või kontroll ebaõnnestus.")
+    healthy = bool(coordinator and peer and not issues)
+    return {'configured': True, 'healthy': healthy, 'running': running, 'issues': issues, 'local': local, 'peer': peer,
             'coordinator': coordinator, 'error': error,
-            'interval': '5 minutit', 'stale_after_seconds': 900}
+            'interval': '5 minutit pärast eelmise töö lõppu', 'stale_after_seconds': 900}
 
 
 def validate_profile(config):

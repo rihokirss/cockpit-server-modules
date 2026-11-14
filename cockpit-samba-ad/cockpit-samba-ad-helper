@@ -107,7 +107,9 @@ def replication():
     inbound=raw.split('==== INBOUND NEIGHBORS ====')[-1].split('==== OUTBOUND NEIGHBORS ====')[0]
     failures=sum(map(int,re.findall(r'(\d+) consecutive failure',inbound)))
     parts=len(re.findall(r'^DC=|^CN=Schema|^CN=Configuration',inbound,re.M)); partners=re.findall(r'\\([^\\\s]+) via RPC',inbound)
-    return {'raw':raw,'failures':failures,'partitions':parts,'partner':partners[0] if partners else '','healthy':parts>0 and failures==0 and 'was successful' in inbound}
+    attempts=re.findall(r'Last attempt .*',inbound)
+    healthy=parts>0 and failures==0 and len(attempts)==parts and all('was successful' in attempt for attempt in attempts)
+    return {'raw':raw,'failures':failures,'partitions':parts,'partner':partners[0] if partners else '','healthy':healthy}
 def sysvol(action='status'):
     helper='/usr/local/libexec/cockpit-samba-sysvol-helper'
     if not Path(helper).is_file():

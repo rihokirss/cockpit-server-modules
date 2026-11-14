@@ -30,8 +30,8 @@ kirjutata auditilogisse.
 - varukoopiad: `/var/backups/samba-ad`
 - audit: `/var/log/cockpit-samba-ad-audit.jsonl`
 
-Varunduse viimane tulemus ja täielik väljund jäävad Hoolduse vaates nähtavaks
-ka ebaõnnestumisel. Logi salvestatakse failis
+Varunduse viimane tulemus ja täielik väljund on Hoolduse vaate allosas suletud
+„Varunduse diagnostika” jaotises, ka ebaõnnestumisel. Logi salvestatakse failis
 `/var/lib/cockpit-samba-ad/backup-status.json` õigustega `0600`; parool ja ajutise
 autentimisfaili asukoht eemaldatakse logitavast tekstist. Pikem viga avaneb ka
 eraldi aknas ega kao ainult mõne sekundi järel sulguvasse teatesse.
@@ -50,7 +50,12 @@ jääb `/var/backups/samba-ad` kataloogi.
 Replikatsioonivaade eristab AD andmebaasi DRS replikatsiooni, SYSVOL-i failide
 sünkroonimist ja mõlema DC kohalike GPO-õiguste kontrolli. Üldolek ei ole roheline,
 kui SYSVOL-i kontroll ebaõnnestub või viimane edukas sünkroonimine on üle 15 minuti
-vana. DRS-i „Sünkrooni AD domeeniandmed” nupp ei kopeeri SYSVOL-i faile.
+vana või koordinaatori timer ei tööta. Partneri sisse lülitatud timer annab
+samuti hoiatuse. Käimasolev töö säilitab värske eelmise õnnestumise tervisenäidu;
+katkenud töö ei jää püsivalt eduka töö varju. Replikatsioonivaade värskendub
+nähtaval lehel iga 15 sekundi järel ja näitab kontrollimise aega. Õiguste kontroll
+kinnitab vastavust AD-le, mitte konkreetse kasutaja lugemisõigust.
+DRS-i „Sünkrooni AD domeeniandmed” nupp ei kopeeri SYSVOL-i faile.
 
 Paigaldaja lisab SYSVOL-i abiprogrammi ja systemd ühikud, kuid ei lülita neid
 automaatselt sisse ega kirjuta üle olemasolevaid Unisoni profiile. Kasutusele

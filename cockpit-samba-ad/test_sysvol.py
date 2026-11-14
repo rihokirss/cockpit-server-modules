@@ -58,6 +58,37 @@ class SysvolTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(list(Path(temp).iterdir()), [path])
 
+    def test_status_requires_one_active_timer_and_a_fresh_success(self):
+        recent = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for case in ('healthy', 'disabled', 'duplicate', 'stale', 'running', 'interrupted'):
+            with self.subTest(case=case):
+                local = {'hostname': 'dc1', 'role': 'coordinator', 'automatic': case != 'disabled',
+                         'service': {'ActiveState': 'activating' if case == 'running' else 'inactive'},
+                         'acl': {'ok': True}, 'last_sync': {'ok': True, 'finished_at': recent, 'last_success': recent}}
+                peer = {'hostname': 'dc2', 'role': 'peer', 'acl': {'ok': True},
+                        'timer': {'ActiveState': 'active' if case == 'duplicate' else 'inactive'}}
+                if case == 'stale': local['last_sync']['finished_at'] = '2000-01-01T00:00:00+00:00'
+                if case in ('running', 'interrupted'): local['last_sync'] = {'running': True, 'ok': False, 'last_success': recent}
+                with patch.object(h, 'status_local', return_value=local), \
+                     patch.object(h, 'remote', return_value=peer), patch.object(h, 'verify_peer_domain'):
+                    result = h.status({'role': 'coordinator'})
+                self.assertEqual(result['healthy'], case in ('healthy', 'running'))
+                self.assertEqual(result['running'], case == 'running')
+                self.assertEqual(bool(result['issues']), not result['healthy'])
+
+    def test_one_successful_drs_partition_cannot_hide_another_failure(self):
+        raw = '''==== INBOUND NEIGHBORS ====
+DC=example,DC=test
+    Last attempt was successful
+    0 consecutive failure(s).
+CN=Configuration,DC=example,DC=test
+    Last attempt failed
+    0 consecutive failure(s).
+==== OUTBOUND NEIGHBORS ====
+'''
+        with patch.object(ad, 'samba', return_value=subprocess.CompletedProcess([], 0, raw, '')):
+            self.assertFalse(ad.replication()['healthy'])
+
     def test_file_conflicts_and_timeouts_still_repair_both_dcs_and_fail(self):
         for outcome in ('conflict', 'timeout', 'ok'):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temp:
