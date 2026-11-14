@@ -15,7 +15,9 @@ async function api(action, payload = {}) {
 function notice(text, error = false) {
   $('message').textContent = text;
   $('message').className = 'message' + (error ? ' error' : '');
-  setTimeout(() => $('message').classList.add('hidden'), 6000);
+  clearTimeout($('message').timer);
+  $('message').setAttribute('role', error ? 'alert' : 'status');
+  if (!error) $('message').timer = setTimeout(() => $('message').classList.add('hidden'), 6000);
 }
 function esc(value) { const node=document.createElement('div'); node.textContent=value ?? ''; return node.innerHTML; }
 

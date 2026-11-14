@@ -4,15 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>RADIUS</title>
-  <link rel="stylesheet" href="../base1/patternfly.css">
+
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="cockpit-common.css">
+  <script src="cockpit-common.js" defer></script>
   <script src="../base1/cockpit.js"></script>
 </head>
 <body>
-  <div id="toast" class="toast hidden"></div>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   <header>
     <div><span class="eyebrow">VÕRGU AUTENTIMINE</span><h1>RADIUS</h1><p id="subtitle">FreeRADIUS · Samba Active Directory</p></div>
-    <div class="header-actions"><span id="health" class="status loading">Kontrollin</span><button id="refresh" class="header-button">↻ Värskenda</button></div>
+    <div class="header-actions"><span id="health" class="status loading">Kontrollin</span><button id="refresh" class="header-button">Värskenda</button></div>
   </header>
   <nav id="nav">
     <button class="active" data-view="overview">Ülevaade</button>

@@ -192,8 +192,36 @@ def mutate(action,target,args,timeout=90):
     try:p=samba(*args,timeout=timeout);audit(action,target);return {'message':(p.stdout or p.stderr).strip() or 'Toiming lõpetatud.'}
     except Exception:audit(action,target,False);raise
 
+def overview_counts():
+    users=user_items()
+    return {'users':len(users),'disabled':sum(x['disabled'] for x in users),
+            'groups':len(group_items()),'computers':len(computer_items()),'zones':len(dns_zones())}
+
+
 def main(req):
     a=req.get('action','')
+    section=req.get('section')
+    if section:
+        # Independent reads let a slow RPC/SSH call leave the rest of the page usable.
+        readers={
+            'overview': {
+                'identity':lambda:{'domain':domain_info(),'service':{'active':service_active()}},
+                'counts':lambda:{'counts':overview_counts()},
+                'replication':lambda:{'replication':replication()},
+                'roles':lambda:{'fsmo':fsmo()},
+            },
+            'replication': {
+                'ad':replication,
+                'sysvol':lambda:{'sysvol':sysvol()},
+            },
+            'operations': {
+                'summary':lambda:{'service_status':'aktiivne' if service_active() else 'peatatud','backups':backups(),'backup_status':backup_status(),'audit':audit_items()},
+                'logs':lambda:{'logs':run(['/usr/bin/journalctl','-u','samba-ad-dc','-n','100','--no-pager'],False).stdout[-24000:]},
+            },
+        }
+        reader=readers.get(a,{}).get(section)
+        if not reader:raise ValueError('Tundmatu vaate osa')
+        return reader()
     if a=='overview':
         d=domain_info(); users=user_items(); groups=group_items(); comps=computer_items(); zones=dns_zones(); rep=replication_status()
         return {'domain':d,'service':{'active':service_active()},'counts':{'users':len(users),'disabled':sum(x['disabled'] for x in users),'groups':len(groups),'computers':len(comps),'zones':len(zones)},'replication':rep,'fsmo':fsmo()}

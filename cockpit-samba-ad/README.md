@@ -45,10 +45,24 @@ Varundusele on lubatud kuni 30 minutit. Samba SYSVOL-i ajutised koopiad luuakse
 privaatse töökausta alla ning eemaldatakse ka ebaõnnestumisel; valmis varukoopia
 jääb `/var/backups/samba-ad` kataloogi.
 
+## Vaadete laadimine
+
+Vaated avanevad kohe ning andmed laaditakse taustal. Ülevaate identiteet,
+objektide arvud, AD replikatsioon ja FSMO rollid laaditakse eraldi; hoolduses
+laaditakse logi ülejäänud andmetest sõltumatult. Replikatsioonivaates ei takista
+aeglane SYSVOL-i SSH-kontroll AD andmete kuvamist. Ebaõnnestunud osa saab uuesti
+laadida sama vaate sees. Hilinenud vastus ei kirjuta teise tabi sisu üle.
+
+Viimati laaditud vaade kuvatakse kohe vahemälust. Kuni 30 sekundi vanuseid
+andmeid taaskasutatakse; „Värskenda” ja muutmistoimingud sunnivad uue päringu.
+Otsingud ning avatud diagnostika ja DNS-tsooni valik säilivad värskendamisel.
+Ülevaade näitab AD andmebaasi tervist; SYSVOL-i halduse olek esitatakse eraldi.
+Seadistamata Cockpiti SYSVOL ei tõesta ega välista teise skripti failikopeerimist.
+
 ## SYSVOL replikatsioon
 
 Replikatsioonivaade eristab AD andmebaasi DRS replikatsiooni, SYSVOL-i failide
-sünkroonimist ja mõlema DC kohalike GPO-õiguste kontrolli. Üldolek ei ole roheline,
+sünkroonimist ja mõlema DC kohalike GPO-õiguste kontrolli. SYSVOL-i olek ei ole korras,
 kui SYSVOL-i kontroll ebaõnnestub või viimane edukas sünkroonimine on üle 15 minuti
 vana või koordinaatori timer ei tööta. Partneri sisse lülitatud timer annab
 samuti hoiatuse. Käimasolev töö säilitab värske eelmise õnnestumise tervisenäidu;

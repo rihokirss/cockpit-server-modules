@@ -18,6 +18,7 @@ install_ui() {
     source_dir=$1
     target_name=$2
     install -d -m 0755 "/usr/local/share/cockpit/$target_name"
+    install -m 0644 "$root_dir/shared/cockpit-common.css" "$root_dir/shared/cockpit-common.js" "/usr/local/share/cockpit/$target_name/"
     install -m 0644 "$source_dir/index.html" "$source_dir/app.js" "$source_dir/style.css" "$source_dir/manifest.json" "/usr/local/share/cockpit/$target_name/"
 }
 

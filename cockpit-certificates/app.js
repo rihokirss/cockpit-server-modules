@@ -27,7 +27,8 @@ function notice(text, error = false) {
   $('message').textContent = text;
   $('message').className = 'message' + (error ? ' error' : '');
   clearTimeout(notice.timer);
-  notice.timer = setTimeout(() => $('message').classList.add('hidden'), 7000);
+  $('message').setAttribute('role', error ? 'alert' : 'status');
+  if (!error) notice.timer = setTimeout(() => $('message').classList.add('hidden'), 7000);
 }
 function setBusy(button, busy, label = 'Töötan…') {
   if (busy) { button.dataset.label = button.textContent; button.textContent = label; button.disabled = true; }

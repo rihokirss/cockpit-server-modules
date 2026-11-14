@@ -45,6 +45,12 @@ Configuration and credentials are deliberately not stored in this repository.
 Runtime secrets are kept in root-only files under `/etc` or passed only for the
 duration of an operation.
 
+All five modules share the UI assets in `shared/`. The installer copies these
+assets into each selected package, so individual modules remain independently
+installable. The UI follows Cockpit's light/dark theme selection, uses Cockpit's
+bundled Red Hat fonts, and supports keyboard tab navigation and narrow screens.
+No external stylesheet or JavaScript download is needed.
+
 ## Development checks
 
 ```bash

@@ -1,11 +1,13 @@
 <!doctype html>
-<html>
+<html lang="et">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Sertifikaadid</title>
-  <link rel="stylesheet" href="../base1/patternfly.css">
+
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="cockpit-common.css">
+  <script src="cockpit-common.js" defer></script>
   <script src="../base1/cockpit.js"></script>
 </head>
 <body>
@@ -30,7 +32,7 @@
 
     <div class="two-column">
       <section class="card compact">
-        <div class="section-head"><div><h2>Automaatne uuendamine</h2><p id="next-run" class="muted">Kontrollin ajakava…</p></div><label class="switch"><input id="renewal-toggle" type="checkbox"><span></span></label></div>
+        <div class="section-head"><div><h2>Automaatne uuendamine</h2><p id="next-run" class="muted">Kontrollin ajakava…</p></div><label class="switch"><input id="renewal-toggle" type="checkbox" aria-label="Automaatne sertifikaatide uuendamine"><span></span></label></div>
         <div class="card-footer"><span>Certbot kontrollib vajadust kaks korda päevas</span><button id="renew-all" class="btn">Kontrolli kohe</button></div>
       </section>
       <section class="card compact">
@@ -49,7 +51,7 @@
     <form id="issue-form">
       <div class="dialog-title"><div><h2 id="issue-title">Taotle sertifikaat</h2><p class="muted">Let's Encrypt kontrollib iga nime selle serveri pordi 80 kaudu.</p></div><button type="button" class="close" data-close="issue-dialog">×</button></div>
       <input id="cert-name" type="hidden">
-      <label>Domeeninimed</label>
+      <label for="domain-input">Domeeninimed</label>
       <div class="domain-entry"><input id="domain-input" placeholder="nas.example.com" autocomplete="off"><button id="domain-add" type="button" class="btn">Lisa</button></div>
       <div id="domain-chips" class="chips"></div>
       <p class="hint">Esimene domeen saab sertifikaadi põhinimeks. Lisa SAN-nimed eraldi.</p>
