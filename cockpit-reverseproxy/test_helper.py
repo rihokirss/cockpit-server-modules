@@ -32,6 +32,26 @@ def site(port, host, upstream_port, scheme='http'):
 
 
 class ReverseProxyHelperTests(unittest.TestCase):
+    def test_migrated_headers_and_timeouts_survive_validation(self):
+        source=site(443,'192.168.0.10',5052)
+        source.update(headers={'Host':'example.ee','X-Forwarded-For':'$remote_addr',
+                               'Cache-Control':'no-store, no-cache'},read_timeout=600,send_timeout=300)
+        result=helper.validate(source)
+        config=helper.generate([result],[],[])
+        self.assertIn('proxy_read_timeout 600s;',config)
+        self.assertIn('proxy_send_timeout 300s;',config)
+        self.assertIn('proxy_set_header Cache-Control "no-store, no-cache";',config)
+        self.assertIn('proxy_set_header X-Forwarded-For "$remote_addr";',config)
+        self.assertEqual(config.count('proxy_set_header Host '),1)
+
+    def test_custom_header_validation_and_quoting_prevent_directive_injection(self):
+        for headers in ({'Bad;name':'value'},{'X-Test':'line\nbreak'},{'X-Test':'a','x-test':'b'},[]):
+            with self.assertRaises(ValueError):helper.proxy_options({'headers':headers})
+        for timeout in (0,86401,True,'1; bad'):
+            with self.assertRaises(ValueError):helper.proxy_options({'read_timeout':timeout})
+        lines=helper.proxy_location('http://example:80',options={'headers':{'X-Test':'"; deny all; #'}})
+        self.assertIn('        proxy_set_header X-Test "\\"; deny all; #";',lines)
+
     def setUp(self):
         self.cert_patch = mock.patch.object(helper, 'has_cert', side_effect=lambda name: name == CERTIFICATE)
         self.cert_patch.start()

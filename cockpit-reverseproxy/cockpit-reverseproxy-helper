@@ -64,7 +64,25 @@ def validate(s):
     if certificate and (not CERT_NAME.fullmatch(certificate) or not has_cert(certificate)): raise ValueError('Valitud sertifikaati ei leitud')
     try: site_id=str(uuid.UUID(str(s.get('id')))) if s.get('id') else str(uuid.uuid4())
     except (ValueError,AttributeError): raise ValueError('Teenuse ID ei ole korrektne')
-    return {'id':site_id,'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True))}
+    return {'id':site_id,'domain':domain,'scheme':scheme,'host':host,'port':port,'https_port':https_port,'certificate':certificate,'websocket':bool(s.get('websocket',True)),'enabled':bool(s.get('enabled',True)),**proxy_options(s)}
+
+def proxy_options(site):
+    result={}
+    for key,default in (('connect_timeout',60),('read_timeout',3600),('send_timeout',3600)):
+        value=site.get(key,default)
+        if isinstance(value,bool) or not re.fullmatch(r'[0-9]{1,5}',str(value)) or not 1<=int(value)<=86400:
+            raise ValueError('Proxy ajalõpp peab olema 1–86400 sekundit')
+        result[key]=int(value)
+    headers=site.get('headers',{})
+    if not isinstance(headers,dict) or len(headers)>32: raise ValueError('Vigased proxy päised')
+    normalized={}
+    for name,value in headers.items():
+        if not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9-]{1,128}',name): raise ValueError('Vigane päise nimi')
+        if not isinstance(value,str) or len(value)>2048 or any(ord(c)<32 or ord(c)==127 for c in value): raise ValueError('Vigane päise väärtus')
+        if name.lower() in normalized: raise ValueError('Korduv päise nimi')
+        normalized[name.lower()]=value
+    result['headers']=dict(headers)
+    return result
 
 def has_cert(name):
     return bool(name and CERT_NAME.fullmatch(name) and Path('/etc/letsencrypt/live',name,'fullchain.pem').exists())
@@ -155,13 +173,21 @@ def validate_route_host(item):
     if certificate and (not has_cert(certificate) or domain not in cert_domains(certificate)): raise ValueError('Sertifikaat ei sisalda ühisdomeeni nime')
     return {'domain':domain,'https_port':https_port,'certificate':certificate,'enabled':bool(item.get('enabled',True))}
 
-def proxy_location(target, websocket=True, indent='        '):
-    lines=[f'{indent}proxy_pass {target};',f'{indent}proxy_http_version 1.1;',f'{indent}proxy_set_header Host $host;',
-           f'{indent}proxy_set_header X-Real-IP $remote_addr;',f'{indent}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
-           f'{indent}proxy_set_header X-Forwarded-Proto $scheme;',f'{indent}proxy_set_header X-Forwarded-Host $host;',
-           f'{indent}proxy_read_timeout 3600s;',f'{indent}proxy_send_timeout 3600s;',f'{indent}proxy_buffering off;']
+def proxy_location(target, websocket=True, indent='        ', options=None):
+    options=proxy_options(options or {})
+    headers={'Host':'$host','X-Real-IP':'$remote_addr','X-Forwarded-For':'$proxy_add_x_forwarded_for',
+             'X-Forwarded-Proto':'$scheme','X-Forwarded-Host':'$host'}
     if websocket:
-        lines += [f'{indent}proxy_set_header Upgrade $http_upgrade;',f'{indent}proxy_set_header Connection $connection_upgrade;']
+        headers.update({'Upgrade':'$http_upgrade','Connection':'$connection_upgrade'})
+    for name,value in options['headers'].items():
+        headers={key:val for key,val in headers.items() if key.lower()!=name.lower()}
+        headers[name]=value
+    lines=[f'{indent}proxy_pass {target};',f'{indent}proxy_http_version 1.1;']
+    for name,value in headers.items():
+        quoted=value.replace('\\','\\\\').replace('"','\\"')
+        lines.append(f'{indent}proxy_set_header {name} "{quoted}";')
+    lines += [f'{indent}proxy_connect_timeout {options["connect_timeout"]}s;',
+              f'{indent}proxy_read_timeout {options["read_timeout"]}s;',f'{indent}proxy_send_timeout {options["send_timeout"]}s;',f'{indent}proxy_buffering off;']
     return lines
 
 def route_locations(routes):
@@ -208,7 +234,7 @@ def generate(sites,routes=None,hosts=None):
         if plain:
             target=f"{plain['scheme']}://{plain['host']}:{plain['port']}"
             out += ['    client_max_body_size 0;','    location / {']
-            out += proxy_location(target,plain['websocket'])
+            out += proxy_location(target,plain['websocket'],options=plain)
             out += ['    }','}','']
         elif tls:
             primary_port=int(tls[0].get('https_port',443))
@@ -219,7 +245,7 @@ def generate(sites,routes=None,hosts=None):
         for site in tls:
             target=f"{site['scheme']}://{site['host']}:{site['port']}"; tls_port=int(site.get('https_port',443)); cert_name=site_certificate(site)
             out += ['server {',f'    listen {tls_port} ssl;',f'    listen [::]:{tls_port} ssl;','    http2 on;',f'    server_name {domain};',f'    ssl_certificate /etc/letsencrypt/live/{cert_name}/fullchain.pem;',f'    ssl_certificate_key /etc/letsencrypt/live/{cert_name}/privkey.pem;','    ssl_protocols TLSv1.2 TLSv1.3;','    ssl_session_cache shared:SSL:10m;','    ssl_session_timeout 1d;','    client_max_body_size 0;','    location / {']
-            out += proxy_location(target,site['websocket'])
+            out += proxy_location(target,site['websocket'],options=site)
             out += ['    }','}','']
     for domain,group in route_groups(routes,sites,hosts).items():
         items=group['routes']; tls_port=group['https_port']; cert_name=group['certificate']

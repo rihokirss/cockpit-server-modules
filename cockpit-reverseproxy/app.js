@@ -56,7 +56,10 @@ function openEditor(id='') {
   $('form-title').textContent=id ? 'Muuda teenust' : 'Lisa teenus'; $('site-id').value=site.id || '';
   ['domain','scheme','host','port'].forEach(key => $(key).value=site[key] || ''); $('https-port').value=site.https_port || 443;
   $('certificate').innerHTML='<option value="">Ilma HTTPS-ita</option>' + certificates.map(cert => `<option value="${esc(cert.name)}">${esc(cert.name)}</option>`).join('');
-  $('certificate').value=site.certificate || ''; $('websocket').checked=site.websocket; $('enabled').checked=site.enabled; $('editor').showModal();
+  $('certificate').value=site.certificate || ''; $('websocket').checked=site.websocket; $('enabled').checked=site.enabled;
+  for(const [key,fallback] of [['connect_timeout',60],['read_timeout',3600],['send_timeout',3600]])$(key.replace('_','-')).value=site[key]??fallback;
+  $('proxy-headers').value=Object.entries(site.headers||{}).map(([key,value])=>`${key}: ${value}`).join('\n');$('proxy-advanced').open=false;
+  $('editor').showModal();
 }
 function openRouteEditor(id='') {
   const route=routes.find(item => item.id === id) || {id:'',domain:'',path:'',scheme:'http',host:'127.0.0.1',port:'',https_port:443,certificate:'',description:'',strip_prefix:true,websocket:true,enabled:true};
@@ -73,7 +76,16 @@ async function routeHealth(id) { const route=routes.find(item=>item.id===id); tr
 $('site-form').onsubmit=async event => {
   event.preventDefault();
   const site={id:$('site-id').value,domain:$('domain').value.trim().toLowerCase(),scheme:$('scheme').value,host:$('host').value.trim(),port:Number($('port').value),https_port:Number($('https-port').value),certificate:$('certificate').value,websocket:$('websocket').checked,enabled:$('enabled').checked};
-  try { await api('save',{original_id:$('site-id').value,site}); $('editor').close(); notice('Konfiguratsioon salvestatud ja nginx uuesti laaditud.'); await refresh(); } catch(error) { notice(error.message,true); }
+  try {
+    site.headers={};
+    for(const line of $('proxy-headers').value.split('\n').filter(line=>line.trim())){
+      const split=line.indexOf(':');if(split<1)throw Error('Päis peab olema kujul Nimi: väärtus');
+      const key=line.slice(0,split).trim();if(Object.keys(site.headers).some(name=>name.toLowerCase()===key.toLowerCase()))throw Error('Korduv päise nimi');
+      site.headers[key]=line.slice(split+1).trim();
+    }
+    for(const key of ['connect_timeout','read_timeout','send_timeout'])site[key]=Number($(key.replace('_','-')).value);
+    await api('save',{original_id:$('site-id').value,site}); $('editor').close(); notice('Konfiguratsioon salvestatud ja nginx uuesti laaditud.'); await refresh();
+  } catch(error) { notice(error.message,true); }
 };
 $('route-form').onsubmit=async event => {
   event.preventDefault();

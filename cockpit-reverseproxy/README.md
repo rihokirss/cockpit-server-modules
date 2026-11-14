@@ -17,6 +17,12 @@ Proxy teenusele saab valida ükskõik millise serveris oleva sertifikaadi, sealh
 mitut domeeni sisaldava SAN-sertifikaadi. Sama domeeni saab kasutada mitme
 teenuse jaoks, kui igal teenusel on erinev avalik HTTPS-port.
 
+Teenuse „Täpsemad proxy seaded” all saab määrata ühenduse, lugemise ja saatmise
+ajalõpu sekundites ning kohandatud päringupäised kujul `Nimi: väärtus`.
+Kohandatud päis asendab samanimelise vaikimisi päise; seaded säilivad ka pärast
+teenuse muutmist. Päiste väärtused kirjutatakse nginx seadistusse jutumärkides
+ja juhtmärgid on keelatud.
+
 Moodul toetab ka mitut rakendust ühe HTTPS-domeeni alamradadel. Alamraja puhul
 saab valida prefiksi eemaldamise, WebSocketi toe ning eraldi upstream-pordi.
 Prefiksi eemaldamisel saadetakse rakendusele `X-Forwarded-Prefix` ja

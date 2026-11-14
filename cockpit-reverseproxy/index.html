@@ -46,6 +46,15 @@
       <p class="muted form-hint">Sertifikaate väljastatakse ja uuendatakse eraldi Sertifikaatide moodulis.</p>
       <label class="check"><input id="websocket" type="checkbox" checked> WebSocketi tugi</label>
       <label class="check"><input id="enabled" type="checkbox" checked> Teenus on aktiivne</label>
+      <details id="proxy-advanced"><summary>Täpsemad proxy seaded</summary>
+        <div class="grid4">
+          <label>Ühenduse ajalõpp (s)<input id="connect-timeout" type="number" min="1" max="86400" value="60" required></label>
+          <label>Lugemise ajalõpp (s)<input id="read-timeout" type="number" min="1" max="86400" value="3600" required></label>
+          <label>Saatmise ajalõpp (s)<input id="send-timeout" type="number" min="1" max="86400" value="3600" required></label>
+        </div>
+        <label>Kohandatud päringupäised<textarea id="proxy-headers" rows="5" placeholder="Cache-Control: no-store"></textarea></label>
+        <p class="muted form-hint">Üks päis real kujul Nimi: väärtus. Samanimeline vaikimisi päis asendatakse.</p>
+      </details>
       <div class="dialog-actions"><button type="button" id="cancel" class="btn">Loobu</button><button class="btn primary">Salvesta ja rakenda</button></div>
     </form>
   </dialog>
