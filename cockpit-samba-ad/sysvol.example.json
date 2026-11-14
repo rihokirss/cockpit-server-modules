@@ -1,0 +1,5 @@
+{
+  "role": "coordinator",
+  "peer": "dc2.example.test",
+  "unison_profile": "sysvol"
+}

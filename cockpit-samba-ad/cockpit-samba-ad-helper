@@ -101,8 +101,25 @@ def ou_items():
     vals=lines(samba('ou','list','--full-dn'))
     return [{'name':re.match(r'OU=([^,]+)',x,re.I).group(1) if re.match(r'OU=([^,]+)',x,re.I) else x,'dn':x} for x in vals]
 def replication():
-    raw=samba('drs','showrepl').stdout; failures=sum(map(int,re.findall(r'(\d+) consecutive failure',raw))); parts=len(re.findall(r'^DC=|^CN=Schema|^CN=Configuration',raw,re.M)); partners=re.findall(r'\\([^\\\s]+) via RPC',raw)
-    return {'raw':raw,'failures':failures,'partitions':parts,'partner':partners[0] if partners else '','healthy':failures==0 and 'was successful' in raw}
+    raw=samba('drs','showrepl').stdout
+    inbound=raw.split('==== INBOUND NEIGHBORS ====')[-1].split('==== OUTBOUND NEIGHBORS ====')[0]
+    failures=sum(map(int,re.findall(r'(\d+) consecutive failure',inbound)))
+    parts=len(re.findall(r'^DC=|^CN=Schema|^CN=Configuration',inbound,re.M)); partners=re.findall(r'\\([^\\\s]+) via RPC',inbound)
+    return {'raw':raw,'failures':failures,'partitions':parts,'partner':partners[0] if partners else '','healthy':parts>0 and failures==0 and 'was successful' in inbound}
+def sysvol(action='status'):
+    helper='/usr/local/libexec/cockpit-samba-sysvol-helper'
+    if not Path(helper).is_file():
+        if action=='status':return {'configured':False,'healthy':False,'error':'SYSVOL abiprogramm pole paigaldatud.'}
+        raise ValueError('SYSVOL abiprogramm pole paigaldatud')
+    p=run([helper,action],False,timeout=240); result=json.loads(p.stdout or '{}')
+    if p.returncode or result.get('error') and action!='status':raise RuntimeError(result.get('error') or p.stderr or 'SYSVOL toiming ebaõnnestus')
+    return result
+def replication_status():
+    result=replication()
+    try:result['sysvol']=sysvol()
+    except Exception as error:result['sysvol']={'configured':False,'healthy':False,'error':str(error)}
+    result['overall_healthy']=result['healthy'] and result['sysvol'].get('healthy',False)
+    return result
 def fsmo():
     raw=samba('fsmo','show').stdout; out=[]
     for line in raw.splitlines():
@@ -155,7 +172,7 @@ def mutate(action,target,args,timeout=90):
 def main(req):
     a=req.get('action','')
     if a=='overview':
-        d=domain_info(); users=user_items(); groups=group_items(); comps=computer_items(); zones=dns_zones(); rep=replication()
+        d=domain_info(); users=user_items(); groups=group_items(); comps=computer_items(); zones=dns_zones(); rep=replication_status()
         return {'domain':d,'service':{'active':service_active()},'counts':{'users':len(users),'disabled':sum(x['disabled'] for x in users),'groups':len(groups),'computers':len(comps),'zones':len(zones)},'replication':rep,'fsmo':fsmo()}
     if a=='users':return {'items':user_items()}
     if a=='groups':return {'items':group_items()}
@@ -163,7 +180,13 @@ def main(req):
     if a=='ous':return {'items':ou_items()}
     if a=='dns':return {'zones':dns_zones()}
     if a=='gpo':return parse_gpo()
-    if a=='replication':return replication()
+    if a=='replication':return replication_status()
+    if a in ('sysvol_sync','sysvol_enable','sysvol_disable','sysvol_check','sysvol_repair'):
+        operation={'sysvol_sync':'request-sync','sysvol_enable':'enable','sysvol_disable':'disable','sysvol_check':'check','sysvol_repair':'repair'}[a]
+        try:
+            result=sysvol(operation);audit(a,'sysvol')
+            return result if 'message' in result else {'output':json.dumps(result,ensure_ascii=False,indent=2)}
+        except Exception:audit(a,'sysvol',False);raise
     if a=='operations':
         logs=run(['/usr/bin/journalctl','-u','samba-ad-dc','-n','100','--no-pager'],False).stdout
         return {'service_status':'aktiivne' if service_active() else 'peatatud','backups':backups(),'logs':logs[-24000:],'audit':audit_items()}
@@ -286,5 +309,6 @@ def main(req):
         run(['/bin/systemctl','restart','samba-ad-dc']);audit(a,'samba-ad-dc');return {'message':'Samba AD DC taaskäivitatud.'}
     raise ValueError('Tundmatu toiming')
 
-try:print(json.dumps(main(json.loads(sys.stdin.read() or '{}')),ensure_ascii=False))
-except Exception as e:print(json.dumps({'error':str(e)},ensure_ascii=False))
+if __name__=='__main__':
+    try:print(json.dumps(main(json.loads(sys.stdin.read() or '{}')),ensure_ascii=False))
+    except Exception as e:print(json.dumps({'error':str(e)},ensure_ascii=False))

@@ -25,6 +25,11 @@ for a small root-owned helper instead of running the browser-facing code as root
 These modules manage existing services. They do not provision a Samba domain or
 replace the distribution's initial service setup.
 
+The Samba AD module also installs optional Unison-based SYSVOL synchronization
+with a systemd timer, per-DC GPO permission restoration, and separate AD/SYSVOL
+health checks. The timer is not enabled until explicitly configured. See
+[`cockpit-samba-ad/README.md`](cockpit-samba-ad/README.md#sysvol-replikatsioon).
+
 ## Install
 
 Run the installer as root and select one or more modules:

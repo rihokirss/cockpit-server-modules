@@ -1,0 +1,12 @@
+[Unit]
+Description=Synchronize Samba SYSVOL and restore AD policy permissions on both DCs
+Wants=network-online.target
+After=network-online.target samba-ad-dc.service
+ConditionPathExists=/etc/cockpit-samba-ad/sysvol.json
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/local/libexec/cockpit-samba-sysvol-helper sync
+TimeoutStartSec=15min

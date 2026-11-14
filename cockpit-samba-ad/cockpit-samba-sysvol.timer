@@ -1,0 +1,11 @@
+[Unit]
+Description=Synchronize Samba SYSVOL every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=15s
+Unit=cockpit-samba-sysvol.service
+
+[Install]
+WantedBy=timers.target

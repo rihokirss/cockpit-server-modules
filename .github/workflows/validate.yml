@@ -11,9 +11,14 @@ jobs:
       - uses: actions/checkout@v5
       - name: Python syntax
         run: python3 -m py_compile cockpit-*/*helper*
+      - name: Samba SYSVOL regression tests
+        run: python3 -m unittest discover -s cockpit-samba-ad -p 'test_*.py' -v
+      - name: RADIUS policy regression tests
+        run: python3 -m unittest discover -s cockpit-radius -p 'test_*.py' -v
       - name: JavaScript syntax
         run: |
           node --check cockpit-certificates/app.js
           node --check cockpit-reverseproxy/app.js
           node --check cockpit-samba-ad/app.js
           node --check cockpit-radius/app.js
+          node --check cockpit-pm2/app.js

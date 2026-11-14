@@ -39,6 +39,12 @@ for module in "$@"; do
             source_dir="$root_dir/cockpit-samba-ad"
             install_ui "$source_dir" samba_ad
             install -m 0755 "$source_dir/cockpit-samba-ad-helper" /usr/local/libexec/cockpit-samba-ad-helper
+            install -m 0755 "$source_dir/cockpit-samba-sysvol-helper" /usr/local/libexec/cockpit-samba-sysvol-helper
+            install -m 0644 "$source_dir/cockpit-samba-sysvol.service" "$source_dir/cockpit-samba-sysvol.timer" /etc/systemd/system/
+            install -d -m 0700 /etc/cockpit-samba-ad /var/lib/cockpit-samba-ad
+            if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+                systemctl daemon-reload
+            fi
             ;;
         radius)
             source_dir="$root_dir/cockpit-radius"

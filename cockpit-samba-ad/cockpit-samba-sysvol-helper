@@ -1,0 +1,397 @@
+#!/usr/bin/python3
+"""SYSVOL file synchronization and local Samba ACL restoration.
+
+One coordinator runs Unison. Each DC derives ACLs from its own AD database;
+numeric Unix IDs and remote security.NTACL xattrs are never copied.
+"""
+import argparse
+import base64
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+CONFIG = Path('/etc/cockpit-samba-ad/sysvol.json')
+STATE = Path('/var/lib/cockpit-samba-ad')
+HELPER = '/usr/local/libexec/cockpit-samba-sysvol-helper'
+SERVICE = 'cockpit-samba-sysvol.service'
+TIMER = 'cockpit-samba-sysvol.timer'
+HOST = re.compile(r'^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$')
+PROFILE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def command(args, timeout=90, check=True, input_text=None):
+    p = subprocess.run(args, input=input_text, capture_output=True, text=True,
+                       timeout=timeout, env={**os.environ, 'LC_ALL': 'C.UTF-8'})
+    if check and p.returncode:
+        raise RuntimeError((p.stderr or p.stdout).strip() or f'{args[0]} exited {p.returncode}')
+    return p
+
+
+def read_json(path, default=None):
+    if not path.exists():
+        return {} if default is None else default
+    return json.loads(path.read_text())
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name)
+    try:
+        with os.fdopen(fd, 'w') as out:
+            json.dump(value, out, ensure_ascii=False, indent=2)
+            out.write('\n')
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def validate_config(config):
+    if config.get('role') not in ('coordinator', 'peer'):
+        raise ValueError('SYSVOL role must be coordinator or peer')
+    if not HOST.fullmatch(str(config.get('peer', ''))):
+        raise ValueError('SYSVOL peer must be a hostname or IPv4 address')
+    if not PROFILE.fullmatch(str(config.get('unison_profile', 'sysvol'))):
+        raise ValueError('Invalid Unison profile name')
+    return {**config, 'unison_profile': config.get('unison_profile', 'sysvol')}
+
+
+def load_config():
+    info = CONFIG.stat()
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('SYSVOL configuration must be root-owned and not writable by others')
+    return validate_config(read_json(CONFIG))
+
+
+def remote(config, action, payload=None, timeout=180):
+    if action not in ('status-local', 'repair', 'record-sync', 'enable', 'disable', 'request-sync'):
+        raise ValueError('Invalid remote action')
+    result = command(['/usr/bin/ssh', '-oBatchMode=yes', '-oConnectTimeout=8',
+                      '-oStrictHostKeyChecking=yes', f"root@{config['peer']}",
+                      HELPER, action], timeout=timeout,
+                     input_text=json.dumps(payload) if payload is not None else None)
+    response = json.loads(result.stdout)
+    if response.get('error'):
+        raise RuntimeError(response['error'])
+    return response
+
+
+def lock(path):
+    handle = open(path, 'a')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError('SYSVOL operation is already running')
+    return handle
+
+
+def acl_check():
+    p = command(['/usr/bin/samba-tool', 'ntacl', 'sysvolcheck', '--color=never'], check=False)
+    return {'ok': p.returncode == 0, 'checked_at': now(),
+            'output': (p.stdout + p.stderr).strip()[-12000:]}
+
+
+def checked_paths(root):
+    """Yield only existing real paths within a policy; never follow symlinks."""
+    root = Path(root)
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError(f'Missing or unsafe SYSVOL directory: {root}')
+    yield root
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = Path(directory) / name
+            if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise ValueError(f'Unsupported SYSVOL entry: {path}')
+            yield path
+
+
+def restore_acls():
+    # Imports are deliberately local: status and unit tests need no Samba bindings.
+    import ldb
+    from samba.auth import system_session
+    from samba.dcerpc import security
+    from samba.ndr import ndr_unpack
+    from samba.ntacls import getntacl, setntacl, dsacl2fsacl
+    from samba.param import LoadParm
+    from samba.provision import SYSVOL_ACL, POLICIES_ACL, system_session_unix
+    from samba.samdb import SamDB
+    from samba.samba3 import param as s3param, passdb
+
+    lp = LoadParm()
+    lp.load('/etc/samba/smb.conf')
+    db = SamDB(url=lp.private_path('sam.ldb'), session_info=system_session(), lp=lp)
+    sid = security.dom_sid(db.get_domain_sid())
+    session = system_session_unix()
+    s3conf = s3param.get_context()
+    s3conf.load(lp.configfile)
+    s3conf.set('passdb backend', 'samba_dsdb:' + db.url)
+    passdb.reload_static_pdb()
+    pdb = passdb.PDB(s3conf.get('passdb backend'))
+    if pdb.domain_info()['dom_sid'] != sid:
+        raise RuntimeError('Local Samba domain SID mismatch')
+    root = Path(lp.get('path', 'sysvol'))
+    realm_root = root / lp.get('realm').lower()
+    plan = [(root, SYSVOL_ACL), (realm_root, SYSVOL_ACL),
+            (Path(lp.get('path', 'netlogon')), SYSVOL_ACL),
+            (realm_root / 'Policies', POLICIES_ACL)]
+    policies = db.search(base='CN=Policies,CN=System,' + str(db.domain_dn()),
+                         scope=ldb.SCOPE_ONELEVEL, attrs=['cn', 'nTSecurityDescriptor'])
+    for policy in policies:
+        name = str(policy['cn'])
+        if not re.fullmatch(r'\{[0-9A-Fa-f-]{36}\}', name):
+            raise ValueError('Invalid GPO directory name in AD')
+        expected = dsacl2fsacl(ndr_unpack(security.descriptor,
+                              policy['nTSecurityDescriptor'][0]).as_sddl(), sid)
+        plan.extend((path, expected) for path in checked_paths(realm_root / 'Policies' / name))
+
+    # Check the complete plan before changing anything. Retain raw xattrs,
+    # including POSIX ACLs, so individual permission changes can be rolled back.
+    changes = []
+    for path, expected in plan:
+        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError(f'Unsafe SYSVOL path: {path}')
+        differs = False
+        for direct in (True, False):
+            try:
+                actual = getntacl(lp, str(path), session, direct_db_access=direct,
+                                  service='sysvol').as_sddl(sid)
+                differs |= actual != expected
+            except OSError:
+                differs = True
+        if differs:
+            changes.append((path, expected))
+
+    backup_dir = Path('/var/backups/cockpit-samba-ad/sysvol-acls')
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup_path = None
+    if changes:
+        fd, name = tempfile.mkstemp(prefix=time.strftime('%Y%m%d-%H%M%S-'),
+                                   suffix='.jsonl', dir=backup_dir)
+        backup_path = name
+        with os.fdopen(fd, 'w') as out:
+            for path, _ in changes:
+                st = path.stat()
+                record = {'path': str(path), 'uid': st.st_uid, 'gid': st.st_gid,
+                          'mode': stat.S_IMODE(st.st_mode),
+                          'xattrs': {key: base64.b64encode(os.getxattr(path, key)).decode()
+                                     for key in os.listxattr(path)}}
+                out.write(json.dumps(record) + '\n')
+            out.flush()
+            os.fsync(out.fileno())
+        for path, expected in changes:
+            setntacl(lp, str(path), expected, str(sid), session,
+                     use_ntvfs=False, skip_invalid_chown=True, passdb=pdb, service='sysvol')
+    result = acl_check()
+    result.update({'repaired': len(changes), 'backup': backup_path})
+    write_json(STATE / 'sysvol-acl.json', result)
+    if not result['ok']:
+        raise RuntimeError('SYSVOL ACL verification failed: ' + result['output'])
+    return result
+
+
+def repair():
+    with lock('/run/lock/cockpit-samba-sysvol-acl.lock'):
+        return restore_acls()
+
+
+def unit_state(unit):
+    result = command(['/usr/bin/systemctl', 'show', unit,
+                      '--property=LoadState,ActiveState,UnitFileState,Result,NextElapseUSecMonotonic'],
+                     check=False)
+    return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+
+
+def domain_identity():
+    from samba.auth import system_session
+    from samba.param import LoadParm
+    from samba.samdb import SamDB
+    lp = LoadParm()
+    lp.load('/etc/samba/smb.conf')
+    db = SamDB(url=lp.private_path('sam.ldb'), session_info=system_session(), lp=lp)
+    return {'realm': lp.get('realm').lower(), 'sid': db.get_domain_sid()}
+
+
+def verify_peer_domain(peer):
+    if peer.get('domain') != domain_identity():
+        raise ValueError('SYSVOL peer belongs to a different or unknown AD domain')
+
+
+def status_local(config):
+    timer = unit_state(TIMER)
+    return {'hostname': socket.gethostname(), 'role': config['role'], 'peer': config['peer'],
+            'domain': domain_identity(),
+            'timer': timer, 'service': unit_state(SERVICE),
+            'automatic': timer.get('ActiveState') == 'active' and timer.get('UnitFileState') == 'enabled',
+            'last_sync': read_json(STATE / 'sysvol-status.json'), 'acl': acl_check()}
+
+
+def sync_health(last_sync, max_age=900):
+    try:
+        age = (datetime.datetime.now(datetime.timezone.utc) -
+               datetime.datetime.fromisoformat(last_sync['finished_at'])).total_seconds()
+        return last_sync.get('ok') is True and 0 <= age <= max_age
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def status(config):
+    local = status_local(config)
+    peer = None
+    error = ''
+    try:
+        peer = remote(config, 'status-local')
+        verify_peer_domain(peer)
+        if peer['role'] == config['role']:
+            raise RuntimeError('Exactly one SYSVOL coordinator is required')
+    except Exception as exc:
+        error = str(exc)
+    coordinator = local if config['role'] == 'coordinator' else peer
+    healthy = bool(not error and coordinator and peer and local['acl']['ok'] and
+                   peer['acl']['ok'] and sync_health(coordinator['last_sync']))
+    return {'configured': True, 'healthy': healthy, 'local': local, 'peer': peer,
+            'coordinator': coordinator, 'error': error,
+            'interval': '5 minutit', 'stale_after_seconds': 900}
+
+
+def validate_profile(config):
+    from samba.param import LoadParm
+    lp = LoadParm()
+    lp.load('/etc/samba/smb.conf')
+    profile = Path('/root/.unison') / (config['unison_profile'] + '.prf')
+    roots = re.findall(r'^\s*root\s*=\s*(.+?)\s*$', profile.read_text(), re.M)
+    local_root = lp.get('path', 'sysvol')
+    expected_remote = f"ssh://root@{config['peer']}/{local_root}"
+    if sorted(roots) != sorted([local_root, expected_remote]):
+        raise ValueError('Unison roots must match local SYSVOL and the configured peer')
+
+
+def run_sync(config):
+    if config['role'] != 'coordinator':
+        raise ValueError('Only the configured coordinator may run Unison')
+    validate_profile(config)
+    with lock('/run/lock/unison-' + config['unison_profile'] + '.lock'):
+        previous = read_json(STATE / 'sysvol-status.json')
+        result = {'started_at': now(), 'ok': False, 'running': True,
+                  'last_success': previous.get('last_success')}
+        write_json(STATE / 'sysvol-status.json', result)
+        try:
+            peer = remote(config, 'status-local')
+            verify_peer_domain(peer)
+            if peer['role'] != 'peer':
+                raise ValueError('Remote SYSVOL role must be peer')
+            local_version = command(['/usr/bin/unison', '-version']).stdout.strip()
+            peer_version = command(['/usr/bin/ssh', '-oBatchMode=yes', '-oConnectTimeout=8',
+                                    '-oStrictHostKeyChecking=yes', f"root@{config['peer']}",
+                                    '/usr/bin/unison', '-version']).stdout.strip()
+            if local_version != peer_version:
+                raise RuntimeError('Unison versions differ between domain controllers')
+            transfer_error = ''
+            try:
+                transfer = command(['/usr/bin/unison', config['unison_profile'], '-batch'],
+                                   timeout=600, check=False)
+                result['transfer_output'] = (transfer.stdout + transfer.stderr)[-12000:]
+                if transfer.returncode:
+                    transfer_error = f'Unison exited {transfer.returncode}: ' + result['transfer_output']
+            except Exception as exc:
+                transfer_error = f'Unison failed: {exc}'
+            # A partial transfer can create files even when Unison reports a
+            # conflict. Restore ACLs on both DCs before reporting that failure.
+            errors = []
+            for target in ('local', 'peer'):
+                try:
+                    result[target + '_acl'] = repair() if target == 'local' else remote(config, 'repair')
+                except Exception as exc:
+                    errors.append(f'{target}: {exc}')
+            if transfer_error:
+                errors.insert(0, transfer_error)
+            if errors:
+                raise RuntimeError('\n'.join(errors))
+            result.update(ok=True, last_success=now())
+        except Exception as exc:
+            result['error'] = str(exc)
+        finally:
+            result.update(finished_at=now(), running=False)
+            write_json(STATE / 'sysvol-status.json', result)
+            try:
+                remote(config, 'record-sync', result)
+            except Exception as exc:
+                error = result.get('error', '')
+                result.update(ok=False, error=(error + '\n' if error else '') + f'Cannot record peer result: {exc}')
+                write_json(STATE / 'sysvol-status.json', result)
+        if not result['ok']:
+            raise RuntimeError(result.get('error', 'SYSVOL synchronization failed'))
+        return result
+
+
+def main(action):
+    if os.geteuid() != 0:
+        raise PermissionError('Run this helper as root')
+    if action == 'repair':
+        return repair()
+    if action == 'check':
+        return acl_check()
+    if not CONFIG.exists() and action == 'status':
+        return {'configured': False, 'healthy': False, 'error': 'SYSVOL sünkroonimine pole seadistatud.'}
+    config = load_config()
+    if action == 'status':
+        return status(config)
+    if action == 'status-local':
+        return status_local(config)
+    if action == 'sync':
+        return run_sync(config)
+    if action == 'record-sync':
+        if config['role'] != 'peer':
+            raise ValueError('Only the peer may accept a coordinator result')
+        value = json.loads(sys.stdin.read(65537))
+        if not isinstance(value, dict) or not isinstance(value.get('ok'), bool):
+            raise ValueError('Invalid synchronization result')
+        write_json(STATE / 'sysvol-status.json', value)
+        return {'ok': True}
+    if config['role'] == 'peer':
+        peer = remote(config, 'status-local')
+        verify_peer_domain(peer)
+        if peer['role'] != 'coordinator':
+            raise ValueError('Remote SYSVOL role must be coordinator')
+        return remote(config, action)
+    if action == 'request-sync':
+        command(['/usr/bin/systemctl', 'start', '--no-block', SERVICE])
+        return {'message': 'SYSVOL-i sünkroonimine käivitati. Värskenda olekut mõne hetke pärast.'}
+    if action == 'enable':
+        validate_profile(config)
+        peer = remote(config, 'status-local')
+        verify_peer_domain(peer)
+        if peer['role'] != 'peer' or peer['timer'].get('ActiveState') == 'active':
+            raise ValueError('Peer must not run its own SYSVOL timer')
+        command(['/usr/bin/systemctl', 'enable', '--now', TIMER])
+        return {'message': 'SYSVOL-i automaatne sünkroonimine on sisse lülitatud.'}
+    if action == 'disable':
+        command(['/usr/bin/systemctl', 'disable', '--now', TIMER])
+        return {'message': 'SYSVOL-i automaatne sünkroonimine on välja lülitatud.'}
+    raise ValueError('Unknown SYSVOL action')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['status', 'status-local', 'sync', 'request-sync',
+                                          'check', 'repair', 'record-sync', 'enable', 'disable'])
+    try:
+        print(json.dumps(main(parser.parse_args().action), ensure_ascii=False))
+    except Exception as exc:
+        print(json.dumps({'error': str(exc)}, ensure_ascii=False))
+        sys.exit(1)
