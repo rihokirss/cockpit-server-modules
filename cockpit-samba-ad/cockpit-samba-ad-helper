@@ -18,7 +18,8 @@ def samba_auth(req,args,timeout=180,cwd=None):
         with tempfile.NamedTemporaryFile('w',prefix='cockpit-samba-auth-',dir='/run',delete=False) as f:
             f.write(f"username = {user}\npassword = {password}\ndomain = {info['netbios']}\n");path=f.name
         os.chmod(path,0o600)
-        return run([SAMBA,*args,'-H','ldap://127.0.0.1','--use-kerberos=off','-A',path,'--color=never'],timeout=timeout,cwd=cwd)
+        target=['-H','ldap://127.0.0.1'] if args[:1]==['gpo'] else []
+        return run([SAMBA,*args,*target,'--use-kerberos=off','-A',path,'--color=never'],timeout=timeout,cwd=cwd)
     finally:
         if path:
             try:os.unlink(path)
@@ -283,7 +284,7 @@ def main(req):
         try:p=samba_auth(req,['gpo','del',n]);audit(a,n);return {'message':p.stdout.strip() or 'GPO kustutatud.'}
         except Exception:audit(a,n,False);raise
     if a=='gpo_backup':
-        n=valid_gpo(req.get('name'));BACKUPS.mkdir(parents=True,exist_ok=True)
+        n=valid_gpo(req.get('name'));BACKUPS.mkdir(mode=0o700,parents=True,exist_ok=True);BACKUPS.chmod(0o700)
         try:p=samba_auth(req,['gpo','backup',n,f'--tmpdir={BACKUPS}'],cwd=BACKUPS);audit(a,n);return {'message':p.stdout.strip() or 'GPO varundatud.'}
         except Exception:audit(a,n,False);raise
     if a=='kcc':return {'output':samba('drs','kcc',domain_info()['dc']).stdout}
@@ -295,7 +296,7 @@ def main(req):
     if a=='testparm':return {'output':run(['/usr/bin/testparm','-s'],False).stdout}
     if a=='logs':return {'output':run(['/usr/bin/journalctl','-u','samba-ad-dc','-n','150','--no-pager'],False).stdout}
     if a=='backup':
-        BACKUPS.mkdir(parents=True,exist_ok=True)
+        BACKUPS.mkdir(mode=0o700,parents=True,exist_ok=True);BACKUPS.chmod(0o700)
         try:p=samba_auth(req,['domain','backup','online',f"--server={domain_info()['dc']}",f'--targetdir={BACKUPS}'],timeout=600);audit(a,str(BACKUPS));return {'message':p.stdout.strip() or 'Varukoopia loodud.'}
         except Exception:audit(a,str(BACKUPS),False);raise
     if a=='backup_verify':
