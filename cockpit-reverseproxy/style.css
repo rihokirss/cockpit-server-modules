@@ -8,3 +8,12 @@
 
 #proxy-advanced{margin-top:16px}#proxy-advanced summary{cursor:pointer}#proxy-headers{font-family:ui-monospace,monospace;resize:vertical}
 fieldset{margin-top:18px;padding:0 14px 14px;border:1px solid #d2d2d2;border-radius:6px}legend{padding:0 6px;font-weight:600}
+
+/* Optional portal and PM2 settings use the shared Cockpit form treatment. */
+.editor-section{margin:16px 0 0;border-top:1px solid var(--line);padding-top:8px}
+.editor-section summary{font-weight:500}
+.toggle-row{gap:16px;border-color:var(--line);align-items:flex-start}
+.toggle-row small{color:var(--muted)}
+.toggle-row input[type=checkbox]{width:16px;height:16px;min-height:0;margin-top:4px;flex-shrink:0}
+.dialog-title{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.dialog-title .close{border:0;background:transparent;color:var(--muted);font-size:24px;line-height:1;font-family:inherit;padding:0 4px;cursor:pointer}

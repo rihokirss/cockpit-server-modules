@@ -57,6 +57,22 @@ class ReverseProxyHelperTests(unittest.TestCase):
         self.cert_patch.start()
         self.addCleanup(self.cert_patch.stop)
 
+    def test_portal_and_dsm_fields_preserve_custom_proxy_options(self):
+        value = site(5001, '192.168.0.252', 5001, 'https')
+        value.update({'dsm_passthrough': True, 'portal_label': 'NAS',
+                      'owner_user': 'rix', 'owner_app': 'nas', 'managed_by': 'pm2',
+                      'headers': {'X-Custom': 'preserved'}, 'connect_timeout': 15,
+                      'read_timeout': 240, 'send_timeout': 120})
+        validated = helper.validate(value)
+        self.assertEqual(validated['portal_label'], 'NAS')
+        self.assertEqual(validated['owner_app'], 'nas')
+        self.assertEqual(validated['headers'], {'X-Custom': 'preserved'})
+        config = '\n'.join(helper.dsm_locations(validated))
+        self.assertIn('proxy_set_header X-Custom "preserved";', config)
+        self.assertIn('proxy_connect_timeout 15s;', config)
+        self.assertIn('proxy_read_timeout 240s;', config)
+        self.assertIn('proxy_send_timeout 120s;', config)
+
     def test_legacy_site_gets_stable_id(self):
         legacy = [{
             'domain': 'a9.kirss.ee', 'scheme': 'https', 'host': '192.168.0.252',

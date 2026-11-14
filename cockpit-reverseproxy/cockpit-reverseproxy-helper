@@ -230,13 +230,13 @@ def dsm_locations(site):
     out=[]
     for path in exact_paths:
         out += [f'    location = {path} {{']
-        out += proxy_location(target,site.get('websocket',True))
+        out += proxy_location(target,site.get('websocket',True),options=site)
         out += ['    }']
     for path in prefix_paths:
         out += [f'    location = {path} {{']
-        out += proxy_location(target,site.get('websocket',True))
+        out += proxy_location(target,site.get('websocket',True),options=site)
         out += ['    }',f'    location ^~ {path}/ {{']
-        out += proxy_location(target,site.get('websocket',True))
+        out += proxy_location(target,site.get('websocket',True),options=site)
         out += ['    }']
     return out
 

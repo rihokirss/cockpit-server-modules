@@ -36,7 +36,7 @@
   </main>
   <dialog id="editor">
     <form id="site-form">
-      <h2 id="form-title">Lisa teenus</h2><input type="hidden" id="site-id">
+      <div class="dialog-title"><h2 id="form-title">Lisa teenus</h2><button type="button" class="close" id="editor-close" aria-label="Sulge dialoog">×</button></div><input type="hidden" id="site-id">
       <label>Domeeninimi<input id="domain" required placeholder="home.example.ee" pattern="[A-Za-z0-9.-]+"></label>
       <div class="grid4">
         <label>Sihtprotokoll<select id="scheme"><option>http</option><option>https</option></select></label>
@@ -46,13 +46,10 @@
       </div>
       <label>TLS-sertifikaat<select id="certificate"><option value="">Ilma HTTPS-ita</option></select></label>
       <p class="muted form-hint">Sertifikaate väljastatakse ja uuendatakse eraldi Sertifikaatide moodulis.</p>
-      <div class="grid-path">
-        <label>PM2 kasutaja<input id="site-owner-user" placeholder="rix" pattern="[a-z_][a-z0-9_-]{0,31}"></label>
-        <label>PM2 rakenduse nimi<input id="site-owner-app" maxlength="100" placeholder="minu-rakendus"></label>
-      </div>
-      <p class="muted form-hint">Valikuline seos kuvab selle täisdomeeni lingi vastava PM2 protsessi juures. Täida mõlemad väljad või jäta mõlemad tühjaks.</p>
-      <fieldset>
-        <legend>Teenuseportaal</legend>
+      <label class="check"><input id="websocket" type="checkbox" checked> WebSocketi tugi</label>
+      <label class="toggle-row"><span>Synology DSM-i veebiteed porti 443<small>Vajalik DSM-i ja Surveillance Stationi avamiseks samal domeenil ilma :5001 pordita.</small></span><input id="dsm-passthrough" type="checkbox"></label>
+      <label class="check"><input id="enabled" type="checkbox" checked> Teenus on aktiivne</label>
+      <details class="editor-section" id="site-portal-options"><summary>Teenuseportaal</summary>
         <div class="grid-path">
           <label>Kuvatav nimi<input id="site-portal-label" maxlength="80" placeholder="Vaikimisi domeeninimi"></label>
           <label>Kategooria<select id="site-portal-category"><option value="service">Teenus</option><option value="home">Kodu</option><option value="storage">Salvestus</option><option value="project">Projekt</option><option value="tool">Tööriist</option></select></label>
@@ -60,11 +57,15 @@
         <label>Kirjeldus<input id="site-portal-description" maxlength="240" placeholder="Lühike avalik kirjeldus"></label>
         <label class="check"><input id="site-portal-hidden" type="checkbox"> Peida teenuseportaalist</label>
         <label class="check"><input id="site-portal-catalog" type="checkbox"> Serveeri selle teenuse kaudu portaali kataloogi</label>
-      </fieldset>
-      <label class="check"><input id="websocket" type="checkbox" checked> WebSocketi tugi</label>
-      <label class="toggle-row"><span>Synology DSM-i veebiteed porti 443<small>Vajalik DSM-i ja Surveillance Stationi avamiseks samal domeenil ilma :5001 pordita.</small></span><input id="dsm-passthrough" type="checkbox"></label>
-      <label class="check"><input id="enabled" type="checkbox" checked> Teenus on aktiivne</label>
-      <details id="proxy-advanced"><summary>Täpsemad proxy seaded</summary>
+      </details>
+      <details class="editor-section" id="site-pm2-options"><summary>Seos PM2 rakendusega</summary>
+      <div class="grid-path">
+        <label>PM2 kasutaja<input id="site-owner-user" placeholder="rix" pattern="[a-z_][a-z0-9_-]{0,31}"></label>
+        <label>PM2 rakenduse nimi<input id="site-owner-app" maxlength="100" placeholder="minu-rakendus"></label>
+      </div>
+      <p class="muted form-hint">Valikuline seos kuvab selle täisdomeeni lingi vastava PM2 protsessi juures. Täida mõlemad väljad või jäta mõlemad tühjaks.</p>
+      </details>
+      <details id="proxy-advanced" class="editor-section"><summary>Täpsemad proxy seaded</summary>
         <div class="grid4">
           <label>Ühenduse ajalõpp (s)<input id="connect-timeout" type="number" min="1" max="86400" value="60" required></label>
           <label>Lugemise ajalõpp (s)<input id="read-timeout" type="number" min="1" max="86400" value="3600" required></label>
@@ -78,7 +79,7 @@
   </dialog>
   <dialog id="route-editor">
     <form id="route-form">
-      <h2 id="route-title">Lisa alamrada</h2><input type="hidden" id="route-original-id"><input type="hidden" id="route-id">
+      <div class="dialog-title"><h2 id="route-title">Lisa alamrada</h2><button type="button" class="close" id="route-editor-close" aria-label="Sulge dialoog">×</button></div><input type="hidden" id="route-original-id"><input type="hidden" id="route-id">
       <div class="grid-path">
         <label>Domeeninimi<input id="route-domain" list="route-domain-list" required placeholder="server.example.ee" pattern="[A-Za-z0-9.-]+"><datalist id="route-domain-list"></datalist></label>
         <label>Alamrada<input id="route-path" required placeholder="/rakendus" pattern="/[a-z0-9][a-z0-9_-]*"></label>
@@ -91,15 +92,14 @@
       </div>
       <label>TLS-sertifikaat<select id="route-certificate"><option value="">Automaatne või HTTP</option></select></label>
       <label>Kirjeldus<input id="route-description" maxlength="160" placeholder="Rakenduse nimi või otstarve"></label>
-      <fieldset>
-        <legend>Teenuseportaal</legend>
+      <details class="editor-section" id="route-portal-options"><summary>Teenuseportaal</summary>
         <div class="grid-path">
           <label>Kuvatav nimi<input id="route-portal-label" maxlength="80" placeholder="Vaikimisi alamraja nimi"></label>
           <label>Kategooria<select id="route-portal-category"><option value="service">Teenus</option><option value="home">Kodu</option><option value="storage">Salvestus</option><option value="project">Projekt</option><option value="tool">Tööriist</option></select></label>
         </div>
         <label>Avalik kirjeldus<input id="route-portal-description" maxlength="240" placeholder="Lühike avalik kirjeldus"></label>
         <label class="check"><input id="route-portal-hidden" type="checkbox"> Peida teenuseportaalist</label>
-      </fieldset>
+      </details>
       <label class="check"><input id="route-strip" type="checkbox" checked> Eemalda alamraja prefiks enne rakendusele edastamist</label>
       <p class="muted form-hint">Näiteks /ilm/api suunatakse prefiksi eemaldamisel rakendusele aadressina /api. Saadetakse ka X-Forwarded-Prefix päis.</p>
       <label class="check"><input id="route-websocket" type="checkbox" checked> WebSocketi tugi</label>

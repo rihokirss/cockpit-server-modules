@@ -64,7 +64,8 @@ function openEditor(id='') {
   $('proxy-headers').value=Object.entries(site.headers||{}).map(([key,value])=>`${key}: ${value}`).join('\n');$('proxy-advanced').open=false;
   $('site-owner-user').value=site.owner_user || ''; $('site-owner-app').value=site.owner_app || ''; $('site-portal-label').value=site.portal_label || ''; $('site-portal-description').value=site.portal_description || ''; $('site-portal-category').value=site.portal_category || 'service'; $('site-portal-hidden').checked=Boolean(site.portal_hidden); $('site-portal-catalog').checked=Boolean(site.portal_catalog);
   $('dsm-passthrough').checked=Boolean(site.dsm_passthrough);
-  $('editor').showModal();
+  for(const id of ['site-pm2-options','site-portal-options'])$(id).open=false;
+  $('editor').showModal(); $('editor').scrollTop=0;
 }
 function openRouteEditor(id='') {
   const route=routes.find(item => item.id === id) || {id:'',domain:'',path:'',scheme:'http',host:'127.0.0.1',port:'',https_port:443,certificate:'',description:'',portal_label:'',portal_description:'',portal_category:'service',portal_hidden:false,strip_prefix:true,websocket:true,enabled:true};
@@ -74,7 +75,7 @@ function openRouteEditor(id='') {
   const domainOptions=[...new Set([...sites.map(item=>item.domain), ...routeHosts.map(item=>item.domain)])];
   $('route-domain-list').innerHTML=domainOptions.map(domain=>`<option value="${esc(domain)}"></option>`).join('');
   $('route-domain').onchange=()=>{const match=sites.find(item=>item.domain===$('route-domain').value.trim().toLowerCase()&&item.https);if(match)$('route-https-port').value=match.https_port||443;};
-  $('route-certificate').value=route.certificate || ''; $('route-portal-label').value=route.portal_label || ''; $('route-portal-description').value=route.portal_description || ''; $('route-portal-category').value=route.portal_category || 'service'; $('route-portal-hidden').checked=Boolean(route.portal_hidden); $('route-strip').checked=route.strip_prefix; $('route-websocket').checked=route.websocket; $('route-enabled').checked=route.enabled; $('route-editor').showModal();
+  $('route-certificate').value=route.certificate || ''; $('route-portal-label').value=route.portal_label || ''; $('route-portal-description').value=route.portal_description || ''; $('route-portal-category').value=route.portal_category || 'service'; $('route-portal-hidden').checked=Boolean(route.portal_hidden); $('route-strip').checked=route.strip_prefix; $('route-websocket').checked=route.websocket; $('route-enabled').checked=route.enabled; $('route-portal-options').open=false; $('route-editor').showModal(); $('route-editor').scrollTop=0;
 }
 async function removeSite(id) { const site=sites.find(item=>item.id===id); if (!site || !confirm(`Kustutada ${site.domain}:${site.https_port || 443}?`)) return; try { await api('delete',{id}); notice('Teenus kustutatud.'); await refresh(); } catch(error) { notice(error.message,true); } }
 async function health(id) { const site=sites.find(item=>item.id===id); try { const result=await api('health',{id}); notice(`${site.domain}:${site.https_port || 443}: siht vastas HTTP ${result.code} (${result.time_ms} ms)`); } catch(error) { notice(`${site?.domain || 'Teenus'}: ${error.message}`,true); } }
@@ -101,6 +102,7 @@ $('route-form').onsubmit=async event => {
   const route={id:$('route-id').value,domain:$('route-domain').value.trim().toLowerCase(),path:$('route-path').value.trim().toLowerCase(),scheme:$('route-scheme').value,host:$('route-host').value.trim(),port:Number($('route-port').value),https_port:Number($('route-https-port').value),certificate:$('route-certificate').value,description:$('route-description').value.trim(),portal_label:$('route-portal-label').value.trim(),portal_description:$('route-portal-description').value.trim(),portal_category:$('route-portal-category').value,portal_hidden:$('route-portal-hidden').checked,strip_prefix:$('route-strip').checked,websocket:$('route-websocket').checked,enabled:$('route-enabled').checked};
   try { await api('route_save',{original_id:$('route-original-id').value,route}); $('route-editor').close(); notice('Alamraja marsruut salvestatud ja Nginx uuesti laaditud.'); await refresh(); } catch(error) { notice(error.message,true); }
 };
+$('editor-close').onclick=()=>$('editor').close(); $('route-editor-close').onclick=()=>$('route-editor').close();
 $('add').onclick=()=>openEditor(); $('cancel').onclick=()=>$('editor').close();
 $('route-add').onclick=()=>openRouteEditor(); $('route-cancel').onclick=()=>$('route-editor').close();
 $('manage-certificates').onclick=()=>cockpit.jump('/certificates');
