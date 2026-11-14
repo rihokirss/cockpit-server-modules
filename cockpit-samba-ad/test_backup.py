@@ -64,12 +64,53 @@ class BackupCommandTests(unittest.TestCase):
             target = Path(directory) / 'backups'
             target.mkdir(mode=0o755)
             with patch.object(h, 'BACKUPS', target), \
+                 patch.object(h, 'BACKUP_STATUS', Path(directory) / 'status.json'), \
                  patch.object(h, 'domain_info', return_value={'dc': 'dc1.example.test'}), \
                  patch.object(h, 'samba_auth', return_value=subprocess.CompletedProcess([], 0, 'ok', '')) as auth, \
                  patch.object(h, 'audit'):
                 h.main({'action': 'backup'})
             self.assertEqual(target.stat().st_mode & 0o777, 0o700)
             self.assertIn('--server=dc1.example.test', auth.call_args.args[1])
+            self.assertFalse(Path(auth.call_args.kwargs['env']['TMPDIR']).exists())
+
+    def test_failed_backup_keeps_both_output_streams_and_redacts_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status=Path(directory) / 'status.json'
+            request={'action':'backup','admin_password':'do-not-log-this'}
+            failed=subprocess.CompletedProcess([],1,'Copying SYSVOL files\n',
+                'Traceback: failure do-not-log-this /run/cockpit-samba-auth-test123')
+            with patch.object(h,'BACKUPS',Path(directory)/'backups'), \
+                 patch.object(h,'BACKUP_STATUS',status), \
+                 patch.object(h,'domain_info',return_value={'dc':'dc1'}), \
+                 patch.object(h,'samba_auth',return_value=failed), \
+                 patch.object(h,'audit'):
+                with self.assertRaises(RuntimeError):h.main(request)
+                record=h.backup_status()
+            self.assertFalse(record['ok'])
+            self.assertIn('Copying SYSVOL files',record['output'])
+            self.assertIn('Traceback',record['output'])
+            self.assertNotIn('do-not-log-this',status.read_text())
+            self.assertNotIn('/run/cockpit-samba-auth-test123',status.read_text())
+            self.assertEqual(status.stat().st_mode & 0o777,0o600)
+
+    def test_failed_sysvol_copy_is_removed_with_private_work_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status=Path(directory)/'status.json'
+            created=[]
+            def failed_copy(request,args,**kwargs):
+                work=Path(kwargs['env']['TMPDIR'])
+                self.assertEqual(work.stat().st_mode & 0o777,0o700)
+                (work/'partial-sysvol-copy').write_text('incomplete data')
+                created.append(work)
+                raise RuntimeError('SMB access denied')
+            with patch.object(h,'BACKUPS',Path(directory)/'backups'), \
+                 patch.object(h,'BACKUP_STATUS',status), \
+                 patch.object(h,'domain_info',return_value={'dc':'dc1'}), \
+                 patch.object(h,'samba_auth',side_effect=failed_copy), \
+                 patch.object(h,'audit'):
+                with self.assertRaisesRegex(RuntimeError,'SMB access denied'):h.main({'action':'backup'})
+            self.assertTrue(created)
+            self.assertFalse(created[0].exists())
 
 
 if __name__ == '__main__':

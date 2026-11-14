@@ -3,14 +3,15 @@ import base64, datetime, json, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 SAMBA='/usr/bin/samba-tool'; BACKUPS=Path('/var/backups/samba-ad'); AUDIT=Path('/var/log/cockpit-samba-ad-audit.jsonl')
+BACKUP_STATUS=Path('/var/lib/cockpit-samba-ad/backup-status.json')
 SAFE_NAME=re.compile(r'^[\w .@()\-+]{1,128}$',re.UNICODE); DNS_NAME=re.compile(r'^[A-Za-z0-9_.*@-]{1,253}$'); ZONE=re.compile(r'^(?=.{1,253}$)[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+\.?$')
 
-def run(args,check=True,timeout=90,cwd=None,input_text=None):
-    p=subprocess.run(args,text=True,input=input_text,capture_output=True,timeout=timeout,cwd=cwd,env={**os.environ,'LANG':'C.UTF-8','LC_ALL':'C.UTF-8'})
+def run(args,check=True,timeout=90,cwd=None,input_text=None,env=None):
+    p=subprocess.run(args,text=True,input=input_text,capture_output=True,timeout=timeout,cwd=cwd,env={**os.environ,'LANG':'C.UTF-8','LC_ALL':'C.UTF-8',**(env or {})})
     if check and p.returncode: raise RuntimeError((p.stderr or p.stdout).strip() or f'{args[0]} ebaõnnestus')
     return p
 def samba(*args,check=True,timeout=90): return run([SAMBA,*map(str,args),'--color=never'],check,timeout)
-def samba_auth(req,args,timeout=180,cwd=None):
+def samba_auth(req,args,timeout=180,cwd=None,check=True,env=None):
     user=valid_name(req.get('admin_user'),'Administraator');password=str(req.get('admin_password') or '')
     if not password:raise ValueError('Domeeniadministraatori parool on kohustuslik')
     info=domain_info(); path=None
@@ -19,7 +20,7 @@ def samba_auth(req,args,timeout=180,cwd=None):
             f.write(f"username = {user}\npassword = {password}\ndomain = {info['netbios']}\n");path=f.name
         os.chmod(path,0o600)
         target=['-H','ldap://127.0.0.1'] if args[:1]==['gpo'] else []
-        return run([SAMBA,*args,*target,'--use-kerberos=off','-A',path,'--color=never'],timeout=timeout,cwd=cwd)
+        return run([SAMBA,*args,*target,'--use-kerberos=off','-A',path,'--color=never'],check=check,timeout=timeout,cwd=cwd,env=env)
     finally:
         if path:
             try:os.unlink(path)
@@ -143,6 +144,25 @@ def backups():
     for p in sorted(BACKUPS.iterdir(),key=lambda x:x.stat().st_mtime,reverse=True):
         if p.is_file():out.append({'name':p.name,'size':f'{p.stat().st_size/1048576:.1f} MB','modified':datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M')})
     return out
+def backup_status():
+    if not BACKUP_STATUS.exists():return {}
+    try:return json.loads(BACKUP_STATUS.read_text())
+    except (OSError,json.JSONDecodeError):return {'ok':False,'output':'Viimase varunduse logi lugemine ebaõnnestus.'}
+def record_backup(ok,output,request):
+    output=str(output)
+    password=str(request.get('admin_password') or '')
+    if password:output=output.replace(password,'[REDACTED]')
+    output=re.sub(r'/run/cockpit-samba-auth-[A-Za-z0-9_.-]+','[temporary credentials]',output)[-65536:]
+    record={'time':datetime.datetime.now(datetime.timezone.utc).isoformat(),'ok':bool(ok),'output':output}
+    BACKUP_STATUS.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    path=None
+    try:
+        with tempfile.NamedTemporaryFile('w',prefix='.backup-status-',dir=BACKUP_STATUS.parent,delete=False) as handle:
+            json.dump(record,handle,ensure_ascii=False);handle.write('\n');path=handle.name
+        os.chmod(path,0o600);os.replace(path,BACKUP_STATUS);path=None
+    finally:
+        if path:Path(path).unlink(missing_ok=True)
+    return record
 def backup_path(name):
     name=str(name or '').strip()
     if not re.fullmatch(r'samba-backup-[A-Za-z0-9_.-]+\.tar\.bz2',name):raise ValueError('Vigane varukoopia nimi')
@@ -190,7 +210,7 @@ def main(req):
         except Exception:audit(a,'sysvol',False);raise
     if a=='operations':
         logs=run(['/usr/bin/journalctl','-u','samba-ad-dc','-n','100','--no-pager'],False).stdout
-        return {'service_status':'aktiivne' if service_active() else 'peatatud','backups':backups(),'logs':logs[-24000:],'audit':audit_items()}
+        return {'service_status':'aktiivne' if service_active() else 'peatatud','backups':backups(),'backup_status':backup_status(),'logs':logs[-24000:],'audit':audit_items()}
     if a=='detail':
         kind=req.get('kind'); name=valid_gpo(req.get('name')) if kind=='gpo' else valid_name(req.get('name'))
         mapping={'users':'user','groups':'group','computers':'computer'}
@@ -297,8 +317,15 @@ def main(req):
     if a=='logs':return {'output':run(['/usr/bin/journalctl','-u','samba-ad-dc','-n','150','--no-pager'],False).stdout}
     if a=='backup':
         BACKUPS.mkdir(mode=0o700,parents=True,exist_ok=True);BACKUPS.chmod(0o700)
-        try:p=samba_auth(req,['domain','backup','online',f"--server={domain_info()['dc']}",f'--targetdir={BACKUPS}'],timeout=600);audit(a,str(BACKUPS));return {'message':p.stdout.strip() or 'Varukoopia loodud.'}
-        except Exception:audit(a,str(BACKUPS),False);raise
+        try:
+            with tempfile.TemporaryDirectory(prefix='.backup-work-',dir=BACKUPS) as workdir:
+                p=samba_auth(req,['domain','backup','online',f"--server={domain_info()['dc']}",f'--targetdir={BACKUPS}'],timeout=1800,check=False,env={'TMPDIR':workdir})
+            record=record_backup(p.returncode==0,(p.stdout+'\n'+p.stderr).strip(),req)
+            if p.returncode:raise RuntimeError(record['output'] or 'Samba varunduskäsk ebaõnnestus')
+            audit(a,str(BACKUPS));return {'message':'Varukoopia loodud. Täpne logi on Hoolduse vaates.'}
+        except Exception as error:
+            record=record_backup(False,str(error),req);audit(a,str(BACKUPS),False)
+            raise RuntimeError(record['output']) from None
     if a=='backup_verify':
         p=backup_path(req.get('name'));run(['/usr/bin/bzip2','-t',str(p)],timeout=300);sha=run(['/usr/bin/sha256sum',str(p)],timeout=300).stdout.split()[0];audit(a,p.name)
         return {'message':'Varukoopia arhiiv on terve.','sha256':sha,'bytes':p.stat().st_size,'modified':datetime.datetime.fromtimestamp(p.stat().st_mtime).isoformat()}

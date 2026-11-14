@@ -30,6 +30,21 @@ kirjutata auditilogisse.
 - varukoopiad: `/var/backups/samba-ad`
 - audit: `/var/log/cockpit-samba-ad-audit.jsonl`
 
+Varunduse viimane tulemus ja täielik väljund jäävad Hoolduse vaates nähtavaks
+ka ebaõnnestumisel. Logi salvestatakse failis
+`/var/lib/cockpit-samba-ad/backup-status.json` õigustega `0600`; parool ja ajutise
+autentimisfaili asukoht eemaldatakse logitavast tekstist. Pikem viga avaneb ka
+eraldi aknas ega kao ainult mõne sekundi järel sulguvasse teatesse.
+
+Online-varunduse konto peab saama lugeda kõiki SYSVOL-i katalooge, sealhulgas
+piiratud ligipääsuga GPO-sid. `sysvolcheck` kinnitab vastavust AD õigustele,
+kuid ei kinnita ühe konkreetse varunduskonto lugemisõigust. Puuduv GPO lugemisõigus
+ei tähenda, et selle konto jaoks tuleks lubada „Apply Group Policy”.
+
+Varundusele on lubatud kuni 30 minutit. Samba SYSVOL-i ajutised koopiad luuakse
+privaatse töökausta alla ning eemaldatakse ka ebaõnnestumisel; valmis varukoopia
+jääb `/var/backups/samba-ad` kataloogi.
+
 ## SYSVOL replikatsioon
 
 Replikatsioonivaade eristab AD andmebaasi DRS replikatsiooni, SYSVOL-i failide
