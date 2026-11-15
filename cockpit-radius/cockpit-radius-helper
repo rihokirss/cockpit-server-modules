@@ -33,6 +33,8 @@ PAP_FILE = ROOT / 'mods-available/cockpit_ad_pap'
 LOG_FILE = ROOT / 'mods-available/cockpit_radius_log'
 SITE_FILE = ROOT / 'sites-available/cockpit-radius'
 EAP_FILE = ROOT / 'mods-available/eap'
+VPN_MODULE = ROOT / 'mods-available/cockpit_vpn_role'
+VPN_CONFIG = ROOT / 'cockpit-vpn-role.json'
 SMB_CONF = Path('/etc/samba/smb.conf')
 SAFE_NAME = re.compile(r'^[\w .@()\-+]{1,128}$', re.UNICODE)
 SAFE_HOST = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$')
@@ -119,7 +121,7 @@ def group_member_count(group):
 def defaults():
     domain = domain_info()
     groups = {name.casefold(): name for name in ad_groups()}
-    group = groups.get('radius', groups.get('domain users', ''))
+    group = groups.get('itk radius', groups.get('radius', groups.get('domain users', '')))
     _, sid, gid = validate_group(group) if group else ('', '', 0)
     return {'server_name': f"radius.{domain['realm'].lower()}", 'allowed_group': group,
             'group_sid': sid, 'group_gid': gid, 'auth_port': 1812, 'accounting_port': 1813,
@@ -216,7 +218,7 @@ def render_pap(config):
 
 
 def render_log_module():
-    return '''# Hallatud Cockpit RADIUS mooduli poolt.\nlinelog cockpit_radius_auth {\n    filename = ${logdir}/cockpit-radius-auth.log\n    permissions = 0640\n    format = "time=%S result=%{reply:Packet-Type} user=%{User-Name} nas=%{NAS-IP-Address} station=%{Calling-Station-Id}"\n}\nlinelog cockpit_radius_accounting {\n    filename = ${logdir}/cockpit-radius-accounting.log\n    permissions = 0640\n    format = "time=%S status=%{Acct-Status-Type} user=%{User-Name} nas=%{NAS-IP-Address} station=%{Calling-Station-Id} session=%{Acct-Session-Id}"\n}\n'''
+    return '''# Hallatud Cockpit RADIUS mooduli poolt.\nlinelog cockpit_radius_auth {\n    filename = ${logdir}/cockpit-radius-auth.log\n    permissions = 0640\n    format = "time=%S result=%{reply:Packet-Type} user=%{User-Name} nas=%{NAS-IP-Address} source=%{Packet-Src-IP-Address} station=%{Calling-Station-Id} address=%{reply:Framed-IP-Address}"\n}\nlinelog cockpit_radius_accounting {\n    filename = ${logdir}/cockpit-radius-accounting.log\n    permissions = 0640\n    format = "time=%S status=%{Acct-Status-Type} user=%{User-Name} nas=%{NAS-IP-Address} source=%{Packet-Src-IP-Address} station=%{Calling-Station-Id} address=%{Framed-IP-Address} session=%{Acct-Session-Id}"\n}\n'''
 
 
 def render_site(config):
@@ -227,7 +229,83 @@ _render_site_template = render_site
 
 
 def render_site(config):
-    return _render_site_template(config).replace('Auth-Type MS-CHAP', 'Auth-Type mschap')
+    text = _render_site_template(config).replace('Auth-Type MS-CHAP', 'Auth-Type mschap')
+    role = config.get('vpn_role', {})
+    if role.get('enabled'):
+        # Packet source is authenticated by the RADIUS client secret. NAS-IP-Address
+        # is client supplied and must not select a privileged role.
+        hook = f'''        if (&Packet-Src-IP-Address == {role['gateway_ip']}) {{
+            cockpit_vpn_role
+            if (reject || fail || invalid || userlock) {{
+                reject
+            }}
+        }}
+'''
+        text = text.replace('    post-auth {\n', '    post-auth {\n' + hook, 1)
+    return text
+
+
+def validate_vpn_role(value, config):
+    if not isinstance(value, dict):
+        raise ValueError('VPN rolli seadistus ei ole korrektne')
+    if value.get('enabled') not in (True, 'yes'):
+        return {'enabled': False}
+    gateway = ipaddress.IPv4Address(str(value.get('gateway_ip', '')))
+    if not any(ipaddress.ip_network(c['ipaddr']) == ipaddress.ip_network(f'{gateway}/32')
+               for c in config['clients']):
+        raise ValueError('VPN gateway peab olema eraldi /32 RADIUS klient')
+    group, sid, gid = validate_group(value.get('group'))
+    subnet = ipaddress.IPv4Network(str(value.get('subnet', '')), strict=True)
+    first = ipaddress.IPv4Address(str(value.get('reserved_start', '')))
+    last = ipaddress.IPv4Address(str(value.get('reserved_end', '')))
+    if not subnet.network_address < first <= last < subnet.broadcast_address:
+        raise ValueError('Reserveeritud aadressid peavad olema VPN alamvõrgu hostiaadressid')
+    addresses = value.get('addresses', {})
+    if isinstance(addresses, str):
+        rows = [row.strip().split('=') for row in addresses.splitlines() if row.strip()]
+        if any(len(row) != 2 for row in rows):
+            raise ValueError('Sisesta iga kasutaja eraldi reale kujul kasutaja=IP')
+        if len({row[0].strip().casefold() for row in rows}) != len(rows):
+            raise ValueError('Kasutajanimed ei tohi korduda')
+        addresses = {u.strip().casefold(): ip.strip() for u, ip in rows}
+    if not isinstance(addresses, dict) or not addresses:
+        raise ValueError('Lisa vähemalt üks reserveeritud kasutaja-aadress')
+    normalized = {}
+    for user, ip in addresses.items():
+        if not re.fullmatch(r'[A-Za-z0-9._+\-]{1,128}', user):
+            raise ValueError('VPN kasutajanimi ei ole korrektne')
+        address = ipaddress.IPv4Address(str(ip))
+        if not first <= address <= last:
+            raise ValueError('Kasutaja aadress peab jääma reserveeritud vahemikku')
+        if user.casefold() in normalized or str(address) in normalized.values():
+            raise ValueError('Kasutajanimed ja aadressid peavad olema unikaalsed')
+        normalized[user.casefold()] = str(address)
+    return {'enabled': True, 'gateway_ip': str(gateway), 'group': group,
+            'group_sid': sid, 'group_gid': gid, 'subnet': str(subnet),
+            'reserved_start': str(first), 'reserved_end': str(last), 'addresses': normalized}
+
+
+def render_vpn_module():
+    return '''# Hallatud Cockpit RADIUS mooduli poolt.
+exec cockpit_vpn_role {
+    wait = yes
+    shell_escape = yes
+    timeout = 7
+    output_pairs = reply
+    program = "/usr/local/libexec/cockpit-radius-vpn-role --username=%{User-Name}"
+}
+'''
+
+
+def vpn_user_aliases(role):
+    aliases = {}
+    for user in role.get('addresses', {}):
+        # Usernames have already been restricted to an LDAP-safe alphabet.
+        result = run(['/usr/bin/ldbsearch', '-H', '/var/lib/samba/private/sam.ldb',
+                      f'(&(objectClass=user)(sAMAccountName={user}))', 'userPrincipalName'])
+        for upn in re.findall(r'^userPrincipalName: (.+)$', result.stdout, re.M):
+            aliases[upn.casefold()] = user
+    return aliases
 
 
 def ensure_eap():
@@ -325,8 +403,13 @@ def server_ip():
 
 
 def configure(config, restart=True):
-    files = [CLIENTS_FILE, MSCHAP_FILE, PAP_FILE, LOG_FILE, SITE_FILE, EAP_FILE, ROOT / 'clients.conf']
+    role = validate_vpn_role(config.get('vpn_role', {'enabled': False}), config)
+    if 'vpn_role' in config:
+        config['vpn_role'] = role
+    files = [CLIENTS_FILE, MSCHAP_FILE, PAP_FILE, LOG_FILE, SITE_FILE, EAP_FILE,
+             ROOT / 'clients.conf', VPN_MODULE, VPN_CONFIG, CONFIG]
     backups = {path: path.read_bytes() if path.exists() else None for path in files}
+    created_links = []
     try:
         ensure_certificate(config['server_name'])
         ensure_eap()
@@ -335,11 +418,16 @@ def configure(config, restart=True):
         atomic_write(MSCHAP_FILE, render_mschap(config), 0o640, 'root', 'freerad')
         atomic_write(PAP_FILE, render_pap(config), 0o640, 'root', 'freerad')
         atomic_write(LOG_FILE, render_log_module(), 0o640, 'root', 'freerad')
+        atomic_write(VPN_MODULE, render_vpn_module(), 0o640, 'root', 'freerad')
+        domain = domain_info()
+        atomic_write(VPN_CONFIG, json.dumps({**role, 'domain': domain['netbios'],
+                     'realm': domain['realm'], 'aliases': vpn_user_aliases(role)}), 0o640, 'root', 'freerad')
         atomic_write(SITE_FILE, render_site(config), 0o640, 'root', 'freerad')
-        for name in ('cockpit_ad_pap', 'cockpit_radius_log'):
+        for name in ('cockpit_ad_pap', 'cockpit_radius_log', 'cockpit_vpn_role'):
             link = ROOT / 'mods-enabled' / name
             if not link.exists():
                 link.symlink_to(Path('../mods-available') / name)
+                created_links.append(link)
         default_link = ROOT / 'sites-enabled/default'
         default_link.unlink(missing_ok=True)
         site_link = ROOT / 'sites-enabled/cockpit-radius'
@@ -353,6 +441,8 @@ def configure(config, restart=True):
         if restart:
             run(['/usr/bin/systemctl', 'restart', 'freeradius'])
     except Exception:
+        for link in created_links:
+            link.unlink(missing_ok=True)
         for path, content in backups.items():
             if content is None:
                 path.unlink(missing_ok=True)
@@ -521,6 +611,12 @@ def main(request):
         return {'activity': activity(), 'active': service_active()}
     if action == 'generate_secret':
         return {'secret': generate_secret()}
+    if action == 'vpn_role_save':
+        config = load_config()
+        config['vpn_role'] = validate_vpn_role(request, config)
+        configure(config)
+        audit(action, config['vpn_role'].get('group', 'disabled'))
+        return {'message': 'VPN roll salvestati. UniFi aadressipool ja tulemüüri õigused seadistatakse eraldi.'}
     if action == 'settings_save':
         config = load_config()
         group, sid, gid = validate_group(request.get('allowed_group'))

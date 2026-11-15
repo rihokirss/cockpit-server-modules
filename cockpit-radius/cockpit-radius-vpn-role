@@ -1,0 +1,66 @@
+#!/usr/bin/python3
+"""Return a reserved address only for authenticated members of a VPN AD role.
+
+Called in post-auth by FreeRADIUS, scoped to the configured NAS packet source.
+This helper never authenticates a password or changes the ordinary RADIUS gate.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG = Path('/etc/freeradius/3.0/cockpit-vpn-role.json')
+
+
+def address_for(config, username, runner=subprocess.run):
+    domain = config['domain']
+    original = username
+    username = config.get('aliases', {}).get(original.casefold(), username)
+    # Ignore users outside the address mapping. Their authentication has already
+    # passed the ordinary RADIUS gate, including any AD-supported UPN suffix.
+    candidate = username.rsplit('\\', 1)[-1].split('@', 1)[0].casefold()
+    if not re.fullmatch(r'[A-Za-z0-9._+\-]{1,128}', candidate):
+        raise ValueError('Invalid username')
+    if candidate not in config['addresses']:
+        return None
+    if '\\' in username:
+        prefix, username = username.split('\\', 1)
+        if prefix.casefold() != domain.casefold():
+            raise ValueError('Foreign domain')
+    if '@' in username:
+        username, realm = username.split('@', 1)
+        if realm.casefold() != config['realm'].casefold():
+            raise ValueError('Foreign realm')
+    if not re.fullmatch(r'[A-Za-z0-9._+\-]{1,128}', username):
+        raise ValueError('Invalid username')
+    address = config['addresses'].get(username.casefold())
+    if not address:
+        return None
+    result = runner(['/usr/bin/wbinfo', f'--user-groups={domain}\\{username}'],
+                    text=True, capture_output=True, timeout=5)
+    if result.returncode:
+        raise RuntimeError('AD group lookup failed')
+    if str(config['group_gid']) not in result.stdout.split():
+        return None
+    return address
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--username', required=True)
+    parser.add_argument('--config', default=str(CONFIG))
+    args = parser.parse_args()
+    address = address_for(json.loads(Path(args.config).read_text()), args.username)
+    if address:
+        print(f'Framed-IP-Address := {address}')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        # rlm_exec status 1 = reject. Never downgrade a failed lookup to admin.
+        print('VPN role lookup failed', file=sys.stderr)
+        sys.exit(1)

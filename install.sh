@@ -52,6 +52,7 @@ for module in "$@"; do
             install_ui "$source_dir" radius
             install -m 0755 "$source_dir/cockpit-radius-helper" /usr/local/libexec/cockpit-radius-helper
             install -m 0755 "$source_dir/cockpit-radius-ntlm-auth" /usr/local/libexec/cockpit-radius-ntlm-auth
+            install -m 0755 "$source_dir/cockpit-radius-vpn-role" /usr/local/libexec/cockpit-radius-vpn-role
             ;;
         pm2)
             source_dir="$root_dir/cockpit-pm2"
